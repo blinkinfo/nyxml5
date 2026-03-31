@@ -1,4 +1,4 @@
-"""CRUD helpers and analytics queries for signals, trades, and settings."""
+"""CRUD helpers and analytics queries for signals, trades, settings, and redemptions."""
 
 from __future__ import annotations
 
@@ -43,6 +43,12 @@ async def is_autotrade_enabled() -> bool:
 async def get_trade_amount() -> float:
     val = await get_setting("trade_amount_usdc")
     return float(val) if val else cfg.TRADE_AMOUNT_USDC
+
+
+async def is_auto_redeem_enabled() -> bool:
+    """Return True if auto-redeem is toggled on in settings."""
+    val = await get_setting("auto_redeem_enabled")
+    return val == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +195,109 @@ async def get_trade_by_signal(signal_id: int) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Redemption CRUD
+# ---------------------------------------------------------------------------
+
+async def insert_redemption(
+    condition_id: str,
+    outcome_index: int,
+    size: float,
+    title: str | None,
+    tx_hash: str | None,
+    status: str,
+    error: str | None = None,
+    gas_used: int | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Insert a redemption record. Returns the new row id."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    resolved_at = now if status in ("success", "failed") else None
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            "INSERT INTO redemptions "
+            "(condition_id, outcome_index, size, title, tx_hash, status, "
+            " error, gas_used, dry_run, resolved_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                condition_id,
+                outcome_index,
+                size,
+                title,
+                tx_hash,
+                status,
+                error,
+                gas_used,
+                1 if dry_run else 0,
+                resolved_at,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_recent_redemptions(n: int = 20) -> list[dict[str, Any]]:
+    """Return the *n* most recent non-dry-run redemption records."""
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM redemptions WHERE dry_run = 0 ORDER BY id DESC LIMIT ?",
+            (n,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def redemption_already_recorded(condition_id: str) -> bool:
+    """Return True if a successful (non-dry-run) redemption exists for *condition_id*.
+
+    Prevents double-redemption: if we already have a success record for this
+    condition, the scheduler skips it on the next scan.
+    """
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id FROM redemptions "
+            "WHERE condition_id = ? AND status = 'success' AND dry_run = 0 LIMIT 1",
+            (condition_id,),
+        )
+        row = await cursor.fetchone()
+        return row is not None
+
+
+async def get_redemption_stats() -> dict[str, Any]:
+    """Aggregate stats for the /redemptions command dashboard."""
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+
+        total_row = await (await db.execute(
+            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0"
+        )).fetchone()
+        total = total_row["cnt"] if total_row else 0
+
+        success_row = await (await db.execute(
+            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'success'"
+        )).fetchone()
+        success = success_row["cnt"] if success_row else 0
+
+        failed_row = await (await db.execute(
+            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'failed'"
+        )).fetchone()
+        failed = failed_row["cnt"] if failed_row else 0
+
+        size_row = await (await db.execute(
+            "SELECT SUM(size) as total_size FROM redemptions WHERE dry_run = 0 AND status = 'success'"
+        )).fetchone()
+        total_size = float(size_row["total_size"] or 0) if size_row else 0.0
+
+    return {
+        "total": total,
+        "success": success,
+        "failed": failed,
+        "total_size": round(total_size, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Streak helpers
 # ---------------------------------------------------------------------------
 
@@ -258,8 +367,6 @@ async def get_signal_stats(limit: int | None = None) -> dict[str, Any]:
         skip_count = row2["cnt"]
 
         # Resolved signals for stats
-        order_clause = "ORDER BY id ASC"
-        limit_clause = ""
         if limit:
             # We need the LAST N resolved signals — subquery to get them in order
             inner = (

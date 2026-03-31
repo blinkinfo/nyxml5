@@ -1,4 +1,4 @@
-"""APScheduler loop — syncs to 5-min slot boundaries, fires signals, trades, resolves."""
+"""APScheduler loop — syncs to 5-min slot boundaries, fires signals, trades, resolves, redeems."""
 
 from __future__ import annotations
 
@@ -172,6 +172,89 @@ async def _reconcile_pending() -> None:
             "Reconciler: resolved signal %d — winner=%s is_win=%s",
             signal_id, winner, is_win,
         )
+
+
+async def _auto_redeem_job() -> None:
+    """Scheduled auto-redeem scan — runs every AUTO_REDEEM_INTERVAL_MINUTES minutes.
+
+    1. Checks if auto_redeem_enabled setting is True.
+    2. Calls scan_and_redeem() for the configured wallet.
+    3. Filters out conditions already recorded as successful in DB.
+    4. Persists each result to the redemptions table.
+    5. Sends a Telegram notification summarising the outcomes.
+    """
+    from core.redeemer import scan_and_redeem
+    from bot.formatters import format_auto_redeem_notification
+
+    # Guard: only run if auto-redeem is enabled
+    enabled = await queries.is_auto_redeem_enabled()
+    if not enabled:
+        log.debug("auto_redeem_job: disabled — skipping")
+        return
+
+    wallet = cfg.POLYMARKET_FUNDER_ADDRESS
+    if not wallet:
+        log.warning("auto_redeem_job: POLYMARKET_FUNDER_ADDRESS not set — skipping")
+        return
+
+    if not cfg.POLYGON_RPC_URL:
+        log.warning("auto_redeem_job: POLYGON_RPC_URL not set — skipping")
+        return
+
+    log.info("auto_redeem_job: scanning wallet %s...", wallet)
+
+    try:
+        results = await scan_and_redeem(wallet, dry_run=False)
+    except Exception:
+        log.exception("auto_redeem_job: scan_and_redeem raised an exception")
+        return
+
+    if not results:
+        log.info("auto_redeem_job: no redeemable positions found")
+        return
+
+    # Deduplicate: skip conditions already successfully redeemed
+    new_results: list[dict] = []
+    for r in results:
+        cid = r.get("condition_id", "")
+        if await queries.redemption_already_recorded(cid):
+            log.debug("auto_redeem_job: condition %s already redeemed — skipping", cid)
+            continue
+        new_results.append(r)
+
+    if not new_results:
+        log.info("auto_redeem_job: all positions already redeemed")
+        return
+
+    # Persist to DB
+    for r in new_results:
+        try:
+            await queries.insert_redemption(
+                condition_id=r["condition_id"],
+                outcome_index=r["outcome_index"],
+                size=r["size"],
+                title=r.get("title"),
+                tx_hash=r.get("tx_hash"),
+                status="success" if r.get("success") else "failed",
+                error=r.get("error"),
+                gas_used=r.get("gas_used"),
+                dry_run=False,
+            )
+        except Exception:
+            log.exception(
+                "auto_redeem_job: failed to persist redemption for condition=%s",
+                r.get("condition_id"),
+            )
+
+    # Notify Telegram
+    msg = format_auto_redeem_notification(new_results)
+    await _send_telegram(msg)
+    log.info(
+        "auto_redeem_job: processed %d redemption(s) (%d success, %d failed)",
+        len(new_results),
+        sum(1 for r in new_results if r.get("success")),
+        sum(1 for r in new_results if not r.get("success")),
+    )
 
 
 async def _check_and_trade() -> None:
@@ -378,7 +461,18 @@ def start_scheduler(tg_app, poly_client) -> AsyncIOScheduler:
     )
     log.info("Reconciler job scheduled (every 5 minutes).")
 
-    # Schedule first check
+    # Auto-redeem: scan for redeemable positions on a configurable interval
+    redeem_interval = cfg.AUTO_REDEEM_INTERVAL_MINUTES
+    SCHEDULER.add_job(
+        _auto_redeem_job,
+        trigger="interval",
+        minutes=redeem_interval,
+        id="auto_redeem",
+        replace_existing=True,
+    )
+    log.info("Auto-redeem job scheduled (every %d minutes).", redeem_interval)
+
+    # Schedule first signal check
     _schedule_next()
 
     log.info("Scheduler started.")

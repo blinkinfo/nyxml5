@@ -93,6 +93,127 @@ def format_resolution(
 
 
 # ---------------------------------------------------------------------------
+# Redemption formatters
+# ---------------------------------------------------------------------------
+
+def format_redeem_preview(results: list[dict]) -> str:
+    """Format /redeem dry-run scan results before user confirms."""
+    SEP = "\u2501" * 20
+    if not results:
+        return (
+            "\U0001f4b0 <b>Redeem — No Positions Found</b>\n"
+            + SEP + "\n"
+            "No redeemable winning positions detected in your wallet.\n"
+            "Positions only appear here once the market resolves on-chain."
+        )
+
+    lines = [
+        f"\U0001f4b0 <b>Redeem Preview ({len(results)} position(s) found)</b>",
+        SEP,
+    ]
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or r.get("condition_id", "Unknown"))[:60]
+        size = r.get("size", 0)
+        lines.append(f"{i}. {title}")
+        lines.append(f"   \U0001f4b0 Size: {size:.4f} shares")
+    lines += [
+        SEP,
+        "Tap <b>Confirm Redeem</b> to execute all redemptions on-chain.",
+    ]
+    return "\n".join(lines)
+
+
+def format_redeem_results(results: list[dict]) -> str:
+    """Format the outcome after redemption transactions are sent."""
+    SEP = "\u2501" * 20
+    if not results:
+        return (
+            "\U0001f4b0 <b>Redeem Complete</b>\n"
+            + SEP + "\n"
+            "No redeemable positions found — nothing to redeem."
+        )
+
+    success_count = sum(1 for r in results if r.get("success"))
+    fail_count = len(results) - success_count
+
+    lines = [
+        f"\U0001f4b0 <b>Redeem Complete</b>  \u2705 {success_count}  \u274c {fail_count}",
+        SEP,
+    ]
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or r.get("condition_id", "Unknown"))[:55]
+        size = r.get("size", 0)
+        if r.get("success"):
+            tx = r.get("tx_hash", "")
+            short_tx = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
+            gas = r.get("gas_used")
+            gas_str = f"  gas={gas:,}" if gas else ""
+            lines.append(f"\u2705 {i}. {title}")
+            lines.append(f"   {size:.4f} shares  tx: <code>{short_tx}</code>{gas_str}")
+        else:
+            err = (r.get("error") or "unknown error")[:80]
+            lines.append(f"\u274c {i}. {title}")
+            lines.append(f"   Error: {err}")
+    lines.append(SEP)
+    return "\n".join(lines)
+
+
+def format_auto_redeem_notification(results: list[dict]) -> str:
+    """Compact notification sent by the auto-redeem scheduler job."""
+    success = [r for r in results if r.get("success")]
+    failed  = [r for r in results if not r.get("success")]
+    SEP = "\u2501" * 20
+
+    lines = [
+        f"\U0001f916 <b>Auto-Redeem Complete</b>  \u2705 {len(success)}  \u274c {len(failed)}",
+        SEP,
+    ]
+    for r in success:
+        title = (r.get("title") or r.get("condition_id", "?"))[:55]
+        tx = r.get("tx_hash", "")
+        short_tx = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
+        lines.append(f"\u2705 {title}")
+        lines.append(f"   tx: <code>{short_tx}</code>")
+    for r in failed:
+        title = (r.get("title") or r.get("condition_id", "?"))[:55]
+        err = (r.get("error") or "unknown")[:60]
+        lines.append(f"\u274c {title}")
+        lines.append(f"   {err}")
+    lines.append(SEP)
+    return "\n".join(lines)
+
+
+def format_redemption_history(stats: dict, recent: list[dict]) -> str:
+    """Format the /redemptions dashboard."""
+    SEP = "\u2501" * 20
+    lines = [
+        "\U0001f4b0 <b>Redemption History</b>",
+        SEP,
+        f"\U0001f4ca Total Redeemed: {stats['total']}",
+        f"\u2705 Success: {stats['success']}  \u274c Failed: {stats['failed']}",
+        f"\U0001f4b0 Total Size Redeemed: {stats['total_size']:.4f} shares",
+        SEP,
+    ]
+    if not recent:
+        lines.append("No redemptions recorded yet.")
+        return "\n".join(lines)
+
+    lines.append("\U0001f4cb <b>Recent Redemptions:</b>")
+    for r in recent:
+        ts = r.get("created_at", "")[:16]
+        title = (r.get("title") or r.get("condition_id", "Unknown"))[:45]
+        size = r.get("size", 0)
+        status = r.get("status", "?")
+        icon = "\u2705" if status == "success" else "\u274c"
+        tx = r.get("tx_hash") or ""
+        short_tx = tx[:8] + "..." if tx else "N/A"
+        lines.append(f"{icon} {ts}  {title}")
+        lines.append(f"   {size:.4f} sh  tx: <code>{short_tx}</code>")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Dashboards (requested via bot commands)
 # ---------------------------------------------------------------------------
 
@@ -153,10 +274,12 @@ def format_status(
     open_positions: int,
     uptime_str: str,
     last_signal: str | None,
+    auto_redeem: bool = False,
 ) -> str:
     conn_icon = "\U0001f7e2" if connected else "\U0001f534"
     conn_text = "Connected" if connected else "Disconnected"
     at_text = "ON" if autotrade else "OFF"
+    ar_text = "ON" if auto_redeem else "OFF"
     bal_text = f"{balance:.2f} USDC" if balance is not None else "N/A"
     sig_text = last_signal or "None"
 
@@ -171,6 +294,7 @@ def format_status(
         f"\U0001f916 AutoTrade: {at_text}",
         f"\U0001f4b5 Trade Amount: ${trade_amount:.2f}",
         f"\U0001f4ca Open Positions: {open_positions}",
+        f"\U0001f4b0 Auto-Redeem: {ar_text}",
         SEP,
         f"\u23f0 Uptime: {uptime_str}",
         f"\U0001f4e1 Last Signal: {sig_text}",
@@ -216,7 +340,9 @@ def format_help() -> str:
         "/status \u2014 Bot status & balance\n"
         "/signals \u2014 Signal performance stats\n"
         "/trades \u2014 Trade P&L dashboard\n"
-        "/settings \u2014 Toggle autotrade, set amount\n"
+        "/redeem \u2014 Scan & redeem winning positions\n"
+        "/redemptions \u2014 Redemption history\n"
+        "/settings \u2014 Toggle autotrade/auto-redeem, set amount\n"
         "/help \u2014 This help message\n\n"
         "<b>How it works:</b>\n"
         "Every 5 minutes the bot checks the NEXT slot's BTC up/down "
@@ -227,5 +353,9 @@ def format_help() -> str:
         "If ADX is <b>rising</b> (strengthening trend), the signal is "
         "<b>flipped</b> (Up\u2194Down) to fade the consensus. If ADX is "
         "falling or flat, the original signal is kept. "
-        "With AutoTrade ON, a FOK market order is placed automatically."
+        "With AutoTrade ON, a FOK market order is placed automatically.\n\n"
+        "<b>Auto-Redeem:</b>\n"
+        "When enabled, the bot periodically scans your wallet for resolved "
+        "winning positions and calls redeemPositions() on the Polygon CTF "
+        "contract to collect your USDC.e. Use /redeem for a manual scan."
     )

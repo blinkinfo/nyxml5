@@ -42,11 +42,27 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    condition_id TEXT NOT NULL,
+    outcome_index INTEGER NOT NULL,
+    size REAL NOT NULL,
+    title TEXT,
+    tx_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    gas_used INTEGER,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    resolved_at TIMESTAMP
+);
 """
 
 DEFAULT_SETTINGS = {
     "autotrade_enabled": "false",
     "trade_amount_usdc": str(cfg.TRADE_AMOUNT_USDC),
+    "auto_redeem_enabled": "false",
 }
 
 

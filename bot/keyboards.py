@@ -20,6 +20,10 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="cmd_settings"),
         ],
         [
+            InlineKeyboardButton("\U0001f4b0 Redeem", callback_data="cmd_redeem"),
+            InlineKeyboardButton("\U0001f4dc Redemptions", callback_data="cmd_redemptions"),
+        ],
+        [
             InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
         ],
     ])
@@ -29,11 +33,17 @@ def main_menu() -> InlineKeyboardMarkup:
 # Settings
 # ---------------------------------------------------------------------------
 
-def settings_keyboard(autotrade_on: bool, trade_amount: float) -> InlineKeyboardMarkup:
+def settings_keyboard(
+    autotrade_on: bool,
+    trade_amount: float,
+    auto_redeem_on: bool = False,
+) -> InlineKeyboardMarkup:
     at_label = "\U0001f916 AutoTrade: ON" if autotrade_on else "\U0001f916 AutoTrade: OFF"
+    ar_label = "\U0001f4b0 Auto-Redeem: ON" if auto_redeem_on else "\U0001f4b0 Auto-Redeem: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(at_label, callback_data="toggle_autotrade")],
         [InlineKeyboardButton(f"\U0001f4b5 Trade Amount: ${trade_amount:.2f}", callback_data="change_amount")],
+        [InlineKeyboardButton(ar_label, callback_data="toggle_auto_redeem")],
         [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
     ])
 
@@ -109,4 +119,29 @@ def download_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f4e5 Download Excel", callback_data="download_xlsx"),
         ],
         [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Redeem keyboards
+# ---------------------------------------------------------------------------
+
+def redeem_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Shown after a dry-run scan — lets user confirm or cancel."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u2705 Confirm Redeem", callback_data="redeem_confirm"),
+            InlineKeyboardButton("\u274c Cancel",          callback_data="redeem_cancel"),
+        ],
+        [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
+def redeem_done_keyboard() -> InlineKeyboardMarkup:
+    """Shown after redemptions complete."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f4dc History", callback_data="cmd_redemptions"),
+            InlineKeyboardButton("\U0001f519 Menu",    callback_data="cmd_menu"),
+        ],
     ])

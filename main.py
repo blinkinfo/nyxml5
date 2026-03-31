@@ -35,6 +35,14 @@ def _validate_config() -> bool:
         if not getattr(cfg, name, None):
             log.error("Missing required env var: %s", name)
             ok = False
+
+    # Warn (but don't block startup) if POLYGON_RPC_URL is missing
+    if not getattr(cfg, "POLYGON_RPC_URL", None):
+        log.warning(
+            "POLYGON_RPC_URL is not set — on-chain redemptions will fail. "
+            "Set this env var to enable /redeem and auto-redeem."
+        )
+
     return ok
 
 
@@ -72,11 +80,13 @@ def main() -> None:
 
         # Register bot commands so they appear in Telegram menu
         await application.bot.set_my_commands([
-            BotCommand("status", "Portfolio overview & bot health"),
-            BotCommand("signals", "Recent trading signals"),
-            BotCommand("trades", "Open & recent trades"),
-            BotCommand("settings", "View/adjust bot settings"),
-            BotCommand("help", "Show available commands"),
+            BotCommand("status",      "Portfolio overview & bot health"),
+            BotCommand("signals",     "Recent trading signals"),
+            BotCommand("trades",      "Open & recent trades"),
+            BotCommand("redeem",      "Scan & redeem winning positions"),
+            BotCommand("redemptions", "Redemption history"),
+            BotCommand("settings",    "View/adjust bot settings"),
+            BotCommand("help",        "Show available commands"),
         ])
 
     application = (

@@ -17,6 +17,14 @@ GAMMA_API_HOST: str = "https://gamma-api.polymarket.com"
 CHAIN_ID: int = 137
 
 # ---------------------------------------------------------------------------
+# Polygon RPC (required for on-chain redemptions via web3.py)
+# ---------------------------------------------------------------------------
+POLYGON_RPC_URL: str = os.getenv(
+    "POLYGON_RPC_URL",
+    "https://polygon-rpc.com",  # public fallback — consider Alchemy/Infura for production
+)
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -44,3 +52,9 @@ SIGNAL_LEAD_TIME: int = 85  # seconds before slot end to check signal
 ADX_LENGTH: int = 14                # ADX period (Wilder's smoothing)
 ADX_CANDLE_COUNT: int = 300         # 5-min candles to fetch from Coinbase (max Coinbase allows; needed for ADX warm-up)
 COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+
+# ---------------------------------------------------------------------------
+# Auto-Redeem
+# ---------------------------------------------------------------------------
+# Scheduler interval (minutes) between automatic redemption scans.
+AUTO_REDEEM_INTERVAL_MINUTES: int = int(os.getenv("AUTO_REDEEM_INTERVAL_MINUTES", "30"))

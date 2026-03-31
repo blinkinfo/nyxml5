@@ -24,6 +24,9 @@ from bot.formatters import (
     format_help,
     format_recent_signals,
     format_recent_trades,
+    format_redeem_preview,
+    format_redeem_results,
+    format_redemption_history,
     format_signal_stats,
     format_status,
     format_trade_stats,
@@ -32,6 +35,8 @@ from bot.keyboards import (
     back_to_menu,
     download_keyboard,
     main_menu,
+    redeem_confirm_keyboard,
+    redeem_done_keyboard,
     settings_keyboard,
     signal_filter_row,
     trade_filter_row,
@@ -111,6 +116,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         positions = await pm_account.get_open_positions(_poly_client)
 
     autotrade = await queries.is_autotrade_enabled()
+    auto_redeem = await queries.is_auto_redeem_enabled()
     trade_amount = await queries.get_trade_amount()
     last_sig = await queries.get_last_signal()
     last_sig_str = None
@@ -126,12 +132,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         open_positions=len(positions),
         uptime_str=_uptime(),
         last_signal=last_sig_str,
+        auto_redeem=auto_redeem,
     )
-    target = update.message if update.message else (update.callback_query.message if update.callback_query else None)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=back_to_menu())
     else:
+        target = update.message
         if target is None:
             return
         await target.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
@@ -190,9 +197,10 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @auth_check
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autotrade = await queries.is_autotrade_enabled()
+    auto_redeem = await queries.is_auto_redeem_enabled()
     trade_amount = await queries.get_trade_amount()
     text = "\u2699\ufe0f <b>Settings</b>\n\nTap a button to change:"
-    kb = settings_keyboard(autotrade, trade_amount)
+    kb = settings_keyboard(autotrade, trade_amount, auto_redeem)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=kb)
@@ -207,6 +215,63 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 @auth_check
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = format_help()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=back_to_menu())
+    else:
+        await update.message.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /redeem — manual redemption (dry-run preview then confirm)
+# ---------------------------------------------------------------------------
+
+@auth_check
+async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step 1: dry-run scan — show what would be redeemed, await confirmation."""
+    from core.redeemer import scan_and_redeem
+
+    wallet = cfg.POLYMARKET_FUNDER_ADDRESS
+    if not wallet:
+        text = "\u274c <b>Redeem Error</b>\n\nPOLYMARKET_FUNDER_ADDRESS is not configured."
+        if update.callback_query:
+            await update.callback_query.answer()
+            await _safe_edit(update.callback_query, text, reply_markup=back_to_menu())
+        else:
+            await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
+        return
+
+    # Show scanning message first
+    scanning_text = "\U0001f50d <b>Scanning wallet for redeemable positions...</b>"
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, scanning_text)
+    else:
+        sent = await update.message.reply_text(scanning_text, parse_mode="HTML")
+
+    results = await scan_and_redeem(wallet, dry_run=True)
+
+    # Store dry-run results in user_data for the confirm step
+    context.user_data["redeem_preview"] = results
+
+    text = format_redeem_preview(results)
+    kb = redeem_confirm_keyboard() if results else back_to_menu()
+
+    if update.callback_query:
+        await _safe_edit(update.callback_query, text, reply_markup=kb)
+    else:
+        await sent.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
+# /redemptions — history dashboard
+# ---------------------------------------------------------------------------
+
+@auth_check
+async def cmd_redemptions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    stats = await queries.get_redemption_stats()
+    recent = await queries.get_recent_redemptions(10)
+    text = format_redemption_history(stats, recent)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=back_to_menu())
@@ -285,6 +350,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "cmd_help":
         await cmd_help(update, context)
 
+    elif data == "cmd_redeem":
+        await cmd_redeem(update, context)
+
+    elif data == "cmd_redemptions":
+        await cmd_redemptions(update, context)
+
     # Signal filters
     elif data == "signals_10":
         await _render_signals(update, limit=10, active="10")
@@ -301,10 +372,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "trades_all":
         await _render_trades(update, limit=None, active="all")
 
-    # Settings
+    # Settings toggles
     elif data == "toggle_autotrade":
         current = await queries.is_autotrade_enabled()
         await queries.set_setting("autotrade_enabled", "false" if current else "true")
+        await cmd_settings(update, context)
+
+    elif data == "toggle_auto_redeem":
+        current = await queries.is_auto_redeem_enabled()
+        await queries.set_setting("auto_redeem_enabled", "false" if current else "true")
+        new_state = "ON" if not current else "OFF"
+        await query.answer(f"Auto-Redeem {new_state}")
         await cmd_settings(update, context)
 
     elif data == "change_amount":
@@ -322,8 +400,60 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "download_xlsx":
         await cmd_download_excel(update, context)
 
+    # Redeem confirm / cancel
+    elif data == "redeem_confirm":
+        await _handle_redeem_confirm(update, context)
+
+    elif data == "redeem_cancel":
+        await query.answer("Cancelled.")
+        await _safe_edit(
+            query,
+            "\u274c Redemption cancelled.",
+            reply_markup=back_to_menu(),
+        )
+
     else:
         await query.answer("Unknown action")
+
+
+async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Execute redemptions after user confirmed the dry-run preview."""
+    from core.redeemer import scan_and_redeem
+
+    query = update.callback_query
+    await query.answer("Executing redemptions...")
+    await _safe_edit(query, "\u23f3 <b>Executing redemptions on-chain...</b>\n\nThis may take up to 2 minutes.")
+
+    wallet = cfg.POLYMARKET_FUNDER_ADDRESS
+    if not wallet:
+        await _safe_edit(
+            query,
+            "\u274c POLYMARKET_FUNDER_ADDRESS not configured.",
+            reply_markup=back_to_menu(),
+        )
+        return
+
+    results = await scan_and_redeem(wallet, dry_run=False)
+
+    # Persist to DB
+    for r in results:
+        try:
+            await queries.insert_redemption(
+                condition_id=r["condition_id"],
+                outcome_index=r["outcome_index"],
+                size=r["size"],
+                title=r.get("title"),
+                tx_hash=r.get("tx_hash"),
+                status="success" if r.get("success") else "failed",
+                error=r.get("error"),
+                gas_used=r.get("gas_used"),
+                dry_run=False,
+            )
+        except Exception:
+            log.exception("Failed to persist redemption record for condition=%s", r.get("condition_id"))
+
+    text = format_redeem_results(results)
+    await _safe_edit(query, text, reply_markup=redeem_done_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +485,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     # Show settings panel again
     autotrade = await queries.is_autotrade_enabled()
-    kb = settings_keyboard(autotrade, amount)
+    auto_redeem = await queries.is_auto_redeem_enabled()
+    kb = settings_keyboard(autotrade, amount, auto_redeem)
     await update.message.reply_text(
         "\u2699\ufe0f <b>Settings</b>",
         reply_markup=kb,
@@ -369,12 +500,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def register(application) -> None:
     """Attach all command and callback handlers to the Telegram Application."""
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("signals", cmd_signals))
-    application.add_handler(CommandHandler("trades", cmd_trades))
-    application.add_handler(CommandHandler("settings", cmd_settings))
-    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("start",       cmd_start))
+    application.add_handler(CommandHandler("status",      cmd_status))
+    application.add_handler(CommandHandler("signals",     cmd_signals))
+    application.add_handler(CommandHandler("trades",      cmd_trades))
+    application.add_handler(CommandHandler("settings",    cmd_settings))
+    application.add_handler(CommandHandler("help",        cmd_help))
+    application.add_handler(CommandHandler("redeem",      cmd_redeem))
+    application.add_handler(CommandHandler("redemptions", cmd_redemptions))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
