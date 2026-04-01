@@ -217,7 +217,6 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
 
 async def redeem_position(
     condition_id_hex: str,
-    outcome_index: int,
 ) -> dict[str, Any]:
     """Call CTF.redeemPositions() on Polygon for one condition.
 
@@ -225,9 +224,6 @@ async def redeem_position(
     ----------
     condition_id_hex : str
         bytes32 condition ID as a 0x-prefixed hex string.
-    outcome_index : int
-        0-based index of the winning outcome we hold.
-
     Returns
     -------
     dict with keys:
@@ -239,13 +235,11 @@ async def redeem_position(
     return await asyncio.to_thread(
         _redeem_position_sync,
         condition_id_hex,
-        outcome_index,
     )
 
 
 def _redeem_position_sync(
     condition_id_hex: str,
-    outcome_index: int,
 ) -> dict[str, Any]:
     """Synchronous inner implementation — runs in a thread pool."""
     try:
@@ -286,8 +280,9 @@ def _redeem_position_sync(
                 "gas_used": None,
             }
 
-        # indexSets — bit mask: outcome 0 -> 1, outcome 1 -> 2, outcome 2 -> 4, ...
-        index_set = 1 << outcome_index
+        # indexSets — pass [1, 2] to redeem all outcomes per Polymarket docs.
+        # The contract burns only winning tokens and ignores losing ones.
+        index_sets = [1, 2]
 
         # --- Check payout denominator to confirm resolution ---
         try:
@@ -317,7 +312,7 @@ def _redeem_position_sync(
                 collateral,
                 parent_collection_id,
                 cid_bytes,
-                [index_set],
+                index_sets,
             ).estimate_gas({"from": account})
             gas_limit = int(estimated_gas * 1.2)  # 20% buffer
         except Exception:
@@ -328,7 +323,7 @@ def _redeem_position_sync(
             collateral,
             parent_collection_id,
             cid_bytes,
-            [index_set],
+            index_sets,
         ).build_transaction({
             "from":     account,
             "nonce":    nonce,
@@ -437,7 +432,7 @@ async def scan_and_redeem(
             })
             continue
 
-        result = await redeem_position(pos["condition_id"], pos["outcome_index"])
+        result = await redeem_position(pos["condition_id"])
         results.append({
             **pos,
             **result,
