@@ -37,11 +37,14 @@ def settings_keyboard(
     autotrade_on: bool,
     trade_amount: float,
     auto_redeem_on: bool = False,
+    n2_filter_on: bool = True,
 ) -> InlineKeyboardMarkup:
     at_label = "\U0001f916 AutoTrade: ON" if autotrade_on else "\U0001f916 AutoTrade: OFF"
+    n2_label = "\U0001f9ea N-2 Filter: ON" if n2_filter_on else "\U0001f9ea N-2 Filter: OFF"
     ar_label = "\U0001f4b0 Auto-Redeem: ON" if auto_redeem_on else "\U0001f4b0 Auto-Redeem: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(at_label, callback_data="toggle_autotrade")],
+        [InlineKeyboardButton(n2_label, callback_data="toggle_n2_filter")],
         [InlineKeyboardButton(f"\U0001f4b5 Trade Amount: ${trade_amount:.2f}", callback_data="change_amount")],
         [InlineKeyboardButton(ar_label, callback_data="toggle_auto_redeem")],
         [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],

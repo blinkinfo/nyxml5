@@ -175,14 +175,7 @@ async def _reconcile_pending() -> None:
 
 
 async def _auto_redeem_job() -> None:
-    """Scheduled auto-redeem scan — runs every AUTO_REDEEM_INTERVAL_MINUTES minutes.
-
-    1. Checks if auto_redeem_enabled setting is True.
-    2. Calls scan_and_redeem() for the configured wallet.
-    3. Filters out conditions already recorded as successful in DB.
-    4. Persists each result to the redemptions table.
-    5. Sends a Telegram notification summarising the outcomes.
-    """
+    """Scheduled auto-redeem scan — runs every AUTO_REDEEM_INTERVAL_MINUTES minutes."""
     from core.redeemer import scan_and_redeem
     from bot.formatters import format_auto_redeem_notification
 
@@ -262,11 +255,13 @@ async def _check_and_trade() -> None:
     from bot.formatters import (
         format_signal,
         format_skip,
+        format_filter_blocked,
         format_trade_filled,
         format_trade_unmatched,
         format_trade_aborted,
         format_trade_retrying,
     )
+    from core.trade_manager import TradeManager
 
     # 1. Check signal
     signal = await strategy.check_signal()
@@ -320,11 +315,31 @@ async def _check_and_trade() -> None:
         skipped=False,
     )
 
-    # 3. Check autotrade
+    # 3. Run Trade Manager filters (N-2 diff filter etc.)
+    filter_result = await TradeManager.check(
+        signal_side=side,
+        current_slot_ts=slot_ts,
+    )
+
+    if not filter_result.allowed:
+        # Update the signal record to mark it as filter-blocked
+        await queries.update_signal_filter_blocked(signal_id)
+        msg = format_filter_blocked(
+            side=side,
+            slot_start_str=slot_start_str,
+            slot_end_str=slot_end_str,
+            reason=filter_result.reason,
+            n2_side=filter_result.n2_side,
+        )
+        await _send_telegram(msg)
+        _schedule_next()
+        return
+
+    # 4. Check autotrade
     autotrade = await queries.is_autotrade_enabled()
     trade_amount = await queries.get_trade_amount()
 
-    # 4. Send signal notification (with ADX info)
+    # 5. Send signal notification (with ADX and N-2 filter info)
     msg = format_signal(
         side=side,
         entry_price=entry_price,
@@ -334,10 +349,12 @@ async def _check_and_trade() -> None:
         adx_direction=adx_direction,
         adx_flipped=adx_flipped,
         adx_value=adx_value,
+        n2_filter_enabled=(await queries.is_n2_filter_enabled()),
+        n2_side=filter_result.n2_side,
     )
     await _send_telegram(msg)
 
-    # 5. Place trade if autotrade on (with robust retry logic)
+    # 6. Place trade if autotrade on (with robust retry logic)
     trade_id: int | None = None
     amount_usdc: float | None = None
     slot_label = f"{slot_start_str}-{slot_end_str}"
@@ -363,16 +380,6 @@ async def _check_and_trade() -> None:
         async def _place_with_notifications():
             """Thin wrapper: forwards retry-in-progress telegrams, then delegates
             to trader.place_fok_order_with_retry for the actual order logic."""
-            # We monkey-patch nothing — instead we intercept by running the
-            # retry loop ourselves at the notification layer only, then delegate
-            # the real work to trader. Because trader already handles all retry
-            # logic internally, we send a single pre-flight "attempt N" message
-            # before calling it.  For per-attempt retrying messages we use a
-            # thin asyncio task that watches the DB retry_count field and fires
-            # a Telegram message each time it increments.
-
-            # Fire a background watcher that sends retrying notifications
-            # whenever the trade row moves to "retrying" status in the DB.
             sent_attempts: set[int] = set()
 
             async def _retry_watcher():
@@ -383,7 +390,6 @@ async def _check_and_trade() -> None:
                     try:
                         row = await queries.get_active_trade_for_signal(signal_id)
                         if row is None:
-                            # Try by trade_id directly via a simple status check
                             continue
                         retry_count = row.get("retry_count", 0) or 0
                         status = row.get("status", "")
@@ -430,7 +436,6 @@ async def _check_and_trade() -> None:
 
         if trade_status == "filled":
             log.info("Trade filled: order_id=%s (attempts=%d)", order_id, attempts)
-            # Extract shares from CLOB result if available
             shares: float | None = result.get("shares")
             msg = format_trade_filled(
                 side=side,
@@ -465,7 +470,7 @@ async def _check_and_trade() -> None:
             await _send_telegram(msg)
             trade_id = None  # don't resolve a non-filled trade
 
-    # 6. Schedule resolution after slot N+1 ends
+    # 7. Schedule resolution after slot N+1 ends
     resolve_time = datetime.fromtimestamp(slot_ts + SLOT_DURATION + 30, tz=timezone.utc)
     if SCHEDULER is not None:
         SCHEDULER.add_job(
@@ -487,7 +492,7 @@ async def _check_and_trade() -> None:
         )
         log.debug("Scheduled resolution for signal %d at %s", signal_id, resolve_time.isoformat())
 
-    # 7. Schedule next check
+    # 8. Schedule next check
     _schedule_next()
 
 
@@ -519,7 +524,6 @@ async def recover_unresolved() -> None:
             trade_id = trade["id"] if trade else None
             amount_usdc = trade["amount_usdc"] if trade else None
 
-            # Schedule immediate resolution (past slots should already be resolved)
             resolve_time = datetime.now(timezone.utc) + timedelta(seconds=5)
             if SCHEDULER is not None:
                 SCHEDULER.add_job(
@@ -540,8 +544,6 @@ async def recover_unresolved() -> None:
                     replace_existing=True,
                 )
 
-    # Pending queue items are left for the 5-minute reconciler (_reconcile_pending),
-    # which fires automatically after startup — no need to re-schedule them here.
     pending = await pending_queue.list_pending()
     if pending:
         log.info(

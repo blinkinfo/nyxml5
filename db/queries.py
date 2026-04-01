@@ -51,6 +51,45 @@ async def is_auto_redeem_enabled() -> bool:
     return val == "true"
 
 
+async def is_n2_filter_enabled() -> bool:
+    """Return True if the Diff-from-N2 trade filter is enabled (default: True)."""
+    val = await get_setting("n2_filter_enabled")
+    # Default to True if not set (safe fallback)
+    return val != "false"
+
+
+async def get_n2_trade_side(current_slot_ts: int) -> str | None:
+    """Return the trade side taken at slot N-2, or None if no trade exists.
+
+    N-2 means the slot whose start timestamp is exactly 2*SLOT_DURATION (600s)
+    before current_slot_ts. We look up the signals table for a non-skipped,
+    non-filter-blocked signal at that timestamp, then check if a filled trade
+    exists for it.
+
+    Returns 'Up', 'Down', or None (no trade / slot was skipped).
+    """
+    from polymarket.markets import SLOT_DURATION
+    n2_ts = current_slot_ts - (2 * SLOT_DURATION)
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        # Find the signal for slot N-2
+        cursor = await db.execute(
+            "SELECT id FROM signals WHERE slot_timestamp = ? AND skipped = 0 AND filter_blocked = 0 LIMIT 1",
+            (n2_ts,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        signal_id = row["id"]
+        # Find a filled trade for that signal
+        cursor2 = await db.execute(
+            "SELECT side FROM trades WHERE signal_id = ? AND status = 'filled' LIMIT 1",
+            (signal_id,),
+        )
+        trade_row = await cursor2.fetchone()
+        return trade_row["side"] if trade_row else None
+
+
 # ---------------------------------------------------------------------------
 # Signal CRUD
 # ---------------------------------------------------------------------------
@@ -63,12 +102,14 @@ async def insert_signal(
     entry_price: float | None,
     opposite_price: float | None,
     skipped: bool = False,
+    filter_blocked: bool = False,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, "
-            "entry_price, opposite_price, skipped) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (slot_start, slot_end, slot_timestamp, side, entry_price, opposite_price, 1 if skipped else 0),
+            "entry_price, opposite_price, skipped, filter_blocked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (slot_start, slot_end, slot_timestamp, side, entry_price, opposite_price,
+             1 if skipped else 0, 1 if filter_blocked else 0),
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
@@ -80,6 +121,16 @@ async def resolve_signal(signal_id: int, outcome: str, is_win: bool) -> None:
         await db.execute(
             "UPDATE signals SET outcome = ?, is_win = ?, resolved_at = ? WHERE id = ?",
             (outcome, 1 if is_win else 0, now, signal_id),
+        )
+        await db.commit()
+
+
+async def update_signal_filter_blocked(signal_id: int) -> None:
+    """Mark a signal as blocked by the trade filter (filter_blocked = 1)."""
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "UPDATE signals SET filter_blocked = 1 WHERE id = ?",
+            (signal_id,),
         )
         await db.commit()
 
@@ -108,7 +159,7 @@ async def get_last_signal() -> dict[str, Any] | None:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM signals WHERE skipped = 0 ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM signals WHERE skipped = 0 AND filter_blocked = 0 ORDER BY id DESC LIMIT 1"
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -152,7 +203,6 @@ async def update_trade_status(trade_id: int, status: str, order_id: str | None =
                 (status, trade_id),
             )
         await db.commit()
-
 
 
 async def update_trade_retry(trade_id: int, status: str, retry_count: int,
@@ -392,8 +442,8 @@ async def get_signal_stats(limit: int | None = None) -> dict[str, Any]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
 
-        # Total signals (non-skipped)
-        q = "SELECT COUNT(*) as cnt FROM signals WHERE skipped = 0"
+        # Total signals (non-skipped, non-filter-blocked)
+        q = "SELECT COUNT(*) as cnt FROM signals WHERE skipped = 0 AND filter_blocked = 0"
         row = await (await db.execute(q)).fetchone()
         total = row["cnt"]
 
@@ -402,17 +452,21 @@ async def get_signal_stats(limit: int | None = None) -> dict[str, Any]:
         row2 = await (await db.execute(q2)).fetchone()
         skip_count = row2["cnt"]
 
-        # Resolved signals for stats
+        # Filter-blocked count
+        q3 = "SELECT COUNT(*) as cnt FROM signals WHERE filter_blocked = 1"
+        row3 = await (await db.execute(q3)).fetchone()
+        filter_blocked_count = row3["cnt"]
+
+        # Resolved signals for stats (exclude skipped and filter-blocked)
         if limit:
-            # We need the LAST N resolved signals — subquery to get them in order
             inner = (
-                f"SELECT * FROM signals WHERE skipped = 0 AND is_win IS NOT NULL "
+                f"SELECT * FROM signals WHERE skipped = 0 AND filter_blocked = 0 AND is_win IS NOT NULL "
                 f"ORDER BY id DESC LIMIT {limit}"
             )
             query = f"SELECT is_win FROM ({inner}) ORDER BY id ASC"
         else:
             query = (
-                "SELECT is_win FROM signals WHERE skipped = 0 AND is_win IS NOT NULL "
+                "SELECT is_win FROM signals WHERE skipped = 0 AND filter_blocked = 0 AND is_win IS NOT NULL "
                 "ORDER BY id ASC"
             )
 
@@ -429,6 +483,7 @@ async def get_signal_stats(limit: int | None = None) -> dict[str, Any]:
     return {
         "total_signals": total,
         "skip_count": skip_count,
+        "filter_blocked_count": filter_blocked_count,
         "wins": wins,
         "losses": losses,
         "resolved": resolved,
