@@ -304,11 +304,12 @@ async def cmd_redemptions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @auth_check
 async def cmd_download_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export all signals as a CSV file (filter_blocked column removed — always was 0)."""
     query = update.callback_query
     await query.answer("Preparing CSV...")
     rows = await queries.get_all_signals_for_export()
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id", "slot_start", "side", "entry_price", "is_win", "filter_blocked"])
+    writer = csv.DictWriter(buf, fieldnames=["id", "slot_start", "side", "entry_price", "is_win"])
     writer.writeheader()
     writer.writerows(rows)
     buf.seek(0)
@@ -321,15 +322,16 @@ async def cmd_download_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @auth_check
 async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export all signals as an Excel file (filter_blocked column removed — always was 0)."""
     query = update.callback_query
     await query.answer("Preparing Excel...")
     rows = await queries.get_all_signals_for_export()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Signals"
-    ws.append(["id", "slot_start", "side", "entry_price", "is_win", "filter_blocked"])
+    ws.append(["id", "slot_start", "side", "entry_price", "is_win"])
     for r in rows:
-        ws.append([r["id"], r["slot_start"], r["side"], r["entry_price"], r["is_win"], r["filter_blocked"]])
+        ws.append([r["id"], r["slot_start"], r["side"], r["entry_price"], r["is_win"]])
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

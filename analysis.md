@@ -14,7 +14,7 @@
 
 ## Architecture Overview
 
-AutoPoly is an automated trading bot for **Polymarket's BTC Up/Down 5-minute binary options markets**. It operates on Polygon mainnet, using the Polymarket CLOB (Central Limit Order Book) for order execution. The bot runs as a Telegram-controlled daemon that checks market prices every 5 minutes, generates trading signals, and optionally executes trades.
+AutoPoly is an automated trading bot for **Polymarket's BTC Up/Down 5-minute binary options markets**. It operates on Polygon mainnet, using the Polymarket CLOB (Central Limit Order Book) for order execution. The bot runs as a Telegram-controlled daemon that checks market prices every 5 minutes, generates trading signals based on 6-candle BTC-USD pattern matching, and optionally executes trades.
 
 ### Layer Structure
 
@@ -47,22 +47,23 @@ main.py (entry point)
 
 [5-MINUTE TRADING LOOP] (runs via APScheduler, synced to slot boundaries)
   1. _check_and_trade() fires at T-85s (85 seconds before current slot N ends)
-  2. strategy.check_signal() fetches N+1 slot prices from Gamma + CLOB APIs
-  3. If either Up or Down price >= 0.51, a signal is generated
-  4. ADX filter: fetch 300 Coinbase 5-min BTC-USD candles, compute ADX(14)
-     - If ADX rising: FLIP the signal (contrarian)
-     - If ADX falling/flat: keep signal as-is
-  5. Insert signal into DB
-  6. TradeManager.check() runs pre-trade filters:
-     - N-2 Diff Filter: current side must differ from N-2 slot's side
-     - N-4 Win Filter: N-4 slot's trade must have been a win
-  7. If filters pass AND autotrade/demotrade enabled:
+  2. strategy.check_signal() delegates to PatternStrategy:
+     a. Fetch the 10 most recently confirmed-closed 5-min BTC-USD candles
+        from Coinbase (dropping the still-open candle at the tail for safety)
+     b. Build 6-char pattern string from candles N-1..N-6
+        Format: [N-1][N-2][N-3][N-4][N-5][N-6], U=up D=down
+     c. Look up pattern in PATTERN_TABLE (22 known patterns)
+     d. If match: fetch Polymarket slot prices, return full signal dict
+     e. If no match: return skip dict (no trade placed)
+  3. Insert signal into DB
+  4. TradeManager.check() — always returns allowed=True (passthrough, no filters)
+  5. If autotrade/demotrade enabled:
      a. Create trade record in DB (status=pending)
      b. Place FOK order via trader.place_fok_order_with_retry()
      c. Up to 3 retry attempts with exponential backoff
      d. Duplicate guard + time fence safety checks
-  8. Schedule resolution job for when slot N+1 ends (+30s buffer)
-  9. _schedule_next() schedules next T-85s check
+  6. Schedule resolution job for when slot N+1 ends (+30s buffer)
+  7. _schedule_next() schedules next T-85s check
 
 [RESOLUTION] (fires ~5.5 min after signal, after slot N+1 ends)
   1. resolver.resolve_slot() polls Coinbase for the 5-min candle covering the slot
@@ -114,17 +115,12 @@ main.py (entry point)
 
 **Trading Parameters**:
 - `TRADE_AMOUNT_USDC` = 1.0 (default)
-- `SIGNAL_THRESHOLD` = 0.51 (price must be >= $0.51 to trigger)
 - `SIGNAL_LEAD_TIME` = 85 seconds
 - `FOK_MAX_RETRIES` = 3
 - `FOK_RETRY_DELAY_BASE` = 2.0s (exponential: 2s, 4s, max 5s)
 - `FOK_RETRY_DELAY_MAX` = 5.0s
 - `FOK_SLOT_CUTOFF_SECONDS` = 30 (abort if less than 30s until slot end)
-
-**ADX Parameters**:
-- `ADX_LENGTH` = 14
-- `ADX_CANDLE_COUNT` = 300 (maximum Coinbase API allows)
-- `COINBASE_CANDLE_URL` = Coinbase API endpoint
+- `COINBASE_CANDLE_URL` = Coinbase API endpoint (used by pattern strategy)
 
 **Polymarket**:
 - `CLOB_HOST` = https://clob.polymarket.com
@@ -139,8 +135,6 @@ main.py (entry point)
 
 #### README.md
 **Purpose**: Project documentation, deployment instructions, strategy explanation.
-
-**Covered**: Strategy overview, ADX filter explanation, timing alignment, Telegram setup, Railway deployment, project structure, technical notes.
 
 #### Procfile / railway.toml
 **Deployment**: Defines `worker: python main.py` for Railway.
@@ -161,7 +155,7 @@ web3>=6.0.0
 
 ### bot/ (Telegram Interface Layer)
 
-#### bot/handlers.py (25KB)
+#### bot/handlers.py
 **Purpose**: All Telegram command and callback query handlers.
 
 **Commands**:
@@ -169,19 +163,19 @@ web3>=6.0.0
 - `/status` - Bot health, balance, autotrade state, open positions, uptime, last signal
 - `/signals` - Signal performance dashboard (win rate, streaks, recent signals)
 - `/trades` - Trade P&L dashboard (net P&L, ROI, streaks, recent trades)
-- `/settings` - Toggle autotrade, N-2 filter, auto-redeem, demo mode; change trade amount; set demo bankroll
+- `/settings` - Toggle autotrade, auto-redeem, demo mode; change trade amount; set demo bankroll
 - `/help` - Command reference + strategy explanation
 - `/redeem` - Manual redemption (dry-run preview, then confirm)
 - `/redemptions` - Redemption history dashboard
 - `/demo` - Demo trading performance dashboard
 
 **Callback Router**: Routes inline keyboard button presses. Key callbacks:
-- `toggle_autotrade`, `toggle_n2_filter`, `toggle_auto_redeem`, `toggle_demo_trade` - Toggle settings in DB
+- `toggle_autotrade`, `toggle_auto_redeem`, `toggle_demo_trade` - Toggle settings in DB
 - `change_amount` - Prompts user for numeric input
 - `redeem_confirm` - Executes actual redemptions after dry-run preview
 - `set_demo_bankroll` / `reset_demo_bankroll` - Manage virtual bankroll
 - Signal/trade filter buttons (Last 10/50/All Time)
-- `download_csv` / `download_xlsx` - Export all signals
+- `download_csv` / `download_xlsx` - Export all signals (columns: id, slot_start, side, entry_price, is_win)
 
 **Key Patterns**:
 - `@auth_check` decorator on every command
@@ -195,13 +189,12 @@ web3>=6.0.0
 
 **Layouts**: main_menu (2-column grid), settings_keyboard (toggle buttons + inputs), filter rows, redeem confirm/cancel, demo filters.
 
-#### bot/formatters.py (25KB)
+#### bot/formatters.py
 **Purpose**: All message formatting with box-drawing characters and emojis.
 
 **Live notifications** (sent by scheduler):
-- `format_signal()` - Signal fired
-- `format_skip()` - No signal, both sides below threshold
-- `format_filter_blocked()` - Trade blocked with reason
+- `format_signal()` - Signal fired (includes pattern string)
+- `format_skip()` - No pattern match, slot skipped
 - `format_signal_resolution()` / `format_trade_resolution()` / `format_demo_resolution()` - Results
 - `format_trade_filled()` / `format_trade_unmatched()` / `format_trade_aborted()` - Order outcomes
 - `format_trade_retrying()` - Inline retry status
@@ -218,7 +211,7 @@ web3>=6.0.0
 
 ### core/ (Trading Engine)
 
-#### core/scheduler.py (26KB - largest file)
+#### core/scheduler.py
 **Purpose**: Manages the 5-minute trading cycle via APScheduler.
 
 **Key Functions**:
@@ -231,28 +224,42 @@ web3>=6.0.0
 - `recover_unresolved()` - On startup, reschedules any unresolved signals
 
 #### core/strategy.py
-**Purpose**: Signal generation engine.
+**Purpose**: Strategy orchestrator — thin wrapper around the active strategy.
 
-**Logic**: `check_signal()` at T-85s:
-1. Get N+1 slot info
-2. Fetch prices (Gamma API for token IDs + CLOB for best ask)
-3. If either Up/Down >= 0.51, generate signal
-4. ADX filter: rising = flip signal, falling/flat = keep
-5. Return signal dict with side, entry_price, token_id, ADX metadata
+**Logic**: Loads the configured strategy class (default: `PatternStrategy`) via the registry in `core/strategies/__init__.py` and delegates `check_signal()` to it. The singleton is cached in a module-level variable.
 
-#### core/adx.py
-**Purpose**: Computes ADX(14) from BTC price data.
+#### core/strategies/base.py
+**Purpose**: Abstract base class for all strategies.
 
-**Algorithm** (Wilder's smoothing, no external TA library):
-1. True Range, +DM, -DM per candle
-2. Wilder's smoothing for TR, +DM, -DM
-3. +DI, -DI from smoothed values
-4. DX from directional indices
-5. ADX from smoothed DX
+Defines the `BaseStrategy` ABC with a single async method: `check_signal() -> dict | None`.
 
-Min candles: 3 * n (42 for n=14). Uses 300 candles from Coinbase public API.
+#### core/strategies/pattern_strategy.py
+**Purpose**: 6-candle BTC-USD pattern matching strategy.
 
-**Trading significance**: Rising ADX = strengthening trend = FLIP signal (contrarian mean-reversion).
+**Algorithm**:
+1. Fetch 10 confirmed-closed 5-min BTC-USD candles from Coinbase.
+   - Drops the most-recent candle in the API response as a safety measure
+     against a still-open candle at the tail (called at T-85s).
+   - Returns exactly the requested count from the confirmed-closed set.
+2. Build 6-char pattern string from candles N-1..N-6:
+   - Character order (left to right): [N-1][N-2][N-3][N-4][N-5][N-6]
+   - U = close >= open (up), D = close < open (down)
+3. Look up pattern in PATTERN_TABLE (22 known profitable patterns).
+4. On match: fetch Polymarket slot N+1 prices, return full signal dict.
+5. On no match: return skip dict (skipped=True, no trade).
+
+**PatternStrategy** formally extends **BaseStrategy** (ABC).
+
+#### core/trade_manager.py
+**Purpose**: Pre-trade gate — now a **passthrough**.
+
+All pre-trade filters (N-2 diff, N-4 win-rate) have been removed. The pattern
+strategy handles all entry decisions internally. `TradeManager.check()` always
+returns `FilterResult(allowed=True)`. The class is retained so the scheduler
+call-site remains intact and can accommodate future filters without changes.
+
+`FilterResult` fields: `allowed`, `reason`, `filter_name`. (Former `n2_side`
+and `n4_win` fields removed along with the filters they supported.)
 
 #### core/trader.py
 **Purpose**: FOK market order execution with retry logic.
@@ -269,15 +276,6 @@ Min candles: 3 * n (42 for n=14). Uses 300 candles from Coinbase public API.
 4. Max 3 retries with exponential backoff (2s, 4s, cap 5s)
 5. Refreshes best ask price between retries
 
-#### core/trade_manager.py
-**Purpose**: Pre-trade filter gate.
-
-**Two filters** (both controlled by n2_filter_enabled, default ON):
-1. **N-2 Diff**: Current signal side must differ from N-2 side. No N-2 data = allow.
-2. **N-4 Must-Be-Win**: N-4 trade must be confirmed win. No data or loss = BLOCK (conservative).
-
-Returns `FilterResult(allowed, reason, filter_name, n2_side, n4_win)`.
-
 #### core/resolver.py
 **Purpose**: Determines trade outcome via Coinbase candle data.
 
@@ -289,7 +287,7 @@ Returns `FilterResult(allowed, reason, filter_name, n2_side, n4_win)`.
 #### core/pending_queue.py
 **Purpose**: Persistent JSON retry queue for unresolved slots. Survives Railway restarts.
 
-#### core/redeemer.py (15KB)
+#### core/redeemer.py
 **Purpose**: Detects and redeems winning positions on-chain.
 
 **Flow**:
@@ -323,38 +321,48 @@ Returns `FilterResult(allowed, reason, filter_name, n2_side, n4_win)`.
 #### db/models.py
 **Tables**:
 1. **signals**: id, slot_start, slot_end, side, entry_price, outcome, is_win, skipped, filter_blocked
+   - `filter_blocked` is retained in schema for backward compatibility but is always 0.
+     The pre-trade filter that set it has been removed.
 2. **trades**: id, signal_id, side, entry_price, amount_usdc, status, pnl, retry_count, is_demo
-3. **settings**: key/value (autotrade_enabled, trade_amount_usdc, n2_filter_enabled, demo_trade_enabled, etc.)
+3. **settings**: key/value (autotrade_enabled, trade_amount_usdc, demo_trade_enabled, etc.)
 4. **redemptions**: condition_id, outcome_index, size, tx_hash, status, gas_used
 
-**Defaults**: autotrade=false, trade_amount=1.0, n2_filter=true, demo_trade=false, demo_bankroll=1000.00
+**Defaults**: autotrade=false, trade_amount=1.0, demo_trade=false, demo_bankroll=1000.00
 
-#### db/queries.py (26KB)
+#### db/queries.py
 Comprehensive CRUD + analytics using aiosqlite:
 - Settings: get/set, toggle methods
-- Signals: insert, resolve, filter update, analytics, export
+- Signals: insert, resolve, analytics, export
 - Trades: insert, update retry, resolve, P&L tracking
-- N-2/N-4 queries: read from signals table at computed timestamps
 - Redemptions: insert, dedup guard, stats
 - Demo: separate bankroll management, trade tracking
 - Streak computation: current, best win, worst loss
+
+**Removed functions** (were N-2/N-4 filter support, no longer needed):
+- `get_n2_trade_side()`, `get_n2_demo_trade_side()`
+- `get_n4_trade_win()`, `get_n4_demo_trade_win()`
+- `update_signal_filter_blocked()`
 
 ---
 
 ## Trading Strategy Deep Dive
 
-### Core Strategy: Early Consensus + Contrarian Fading
+### Core Strategy: 6-Candle Pattern Matching
 
-The bot exploits the fact that the N+1 market is already trading before slot N closes.
+The bot reads the last six confirmed-closed 5-min BTC-USD candles from
+Coinbase and builds a direction string. If the pattern matches one of the 22
+known entries in PATTERN_TABLE, a trade is placed for the predicted N+1
+direction.
 
-**Flow**:
-1. At 3:35 into each 5-min slot, bot reads N+1 prices
-2. If either price >= $0.51, market has formed early consensus (51%+)
-3. ADX determines action:
-   - ADX rising (trend strengthening) = contrarian flip
-   - ADX falling (trend weakening) = ride consensus
+**Pattern string format** (left to right): [N-1][N-2][N-3][N-4][N-5][N-6]
+- N-1 = most recently closed candle
+- U = close >= open (bullish), D = close < open (bearish)
 
-**Rationale**: Strong consensus during a strengthening trend may represent overreaction. Fade it. Weak trends = ride the consensus.
+**Example**: `DUUUDU` means N-1 down, N-2 up, N-3 up, N-4 up, N-5 down, N-6 up.
+
+**Candle timing safety**: Called at T-85s (215s into a 300s slot), the current
+candle is still open. The strategy always drops the most-recent API response
+candle before slicing, ensuring only confirmed-closed candles are used.
 
 ### Resolution Mechanism
 
@@ -369,11 +377,10 @@ Uses Coinbase BTC-USD candles, NOT Polymarket on-chain resolution. More reliable
 - No martingale, Kelly, or dynamic sizing
 - Bankroll clamped to >= 0 in demo mode
 
-### Pre-Trade Filters (N-2 Filter, default ON)
-1. **Side alternation**: Can't trade same direction as N-2
-2. **Win streak requirement**: N-4 slot must have been a win
-
-These prevent correlated losses and enforce cool-off periods.
+### Pre-Trade Filters
+All pre-trade filters have been removed. The pattern strategy handles entry
+decisions internally via PATTERN_TABLE lookup. `TradeManager` is a passthrough
+that always returns `allowed=True`.
 
 ### Execution Safeguards
 - FOK orders (no partial fills, immediate kill if not fillable)
@@ -386,12 +393,16 @@ These prevent correlated losses and enforce cool-off periods.
 ## P&L Calculation
 
 ```
-Win:  pnl = amount * (1/entry_price - 1)
-Loss: pnl = -amount
+Win:  pnl = amount_usdc * (1/entry_price - 1)
+Loss: pnl = -amount_usdc
 ```
 
-At $0.51 entry: break-even win rate = 1 - 0.51 = 49%
-At $0.52 entry: break-even = 1 - 0.52 = 48%
+This is the standard Polymarket binary token payout formula.
+Buying `amount` at price `p` (where 0 < p < 1) pays out `amount/p` on win.
+Profit = amount/p - amount = amount * (1/p - 1).
+
+At $0.51 entry: break-even win rate = ~51%
+At $0.60 entry: break-even win rate = ~60%
 
 ---
 
@@ -401,9 +412,13 @@ At $0.52 entry: break-even = 1 - 0.52 = 48%
 APScheduler (every 5 min)
   -> _check_and_trade()
     -> strategy.check_signal()
-         -> markets.get_slot_prices() -> Gamma API + CLOB API
-         -> adx.get_adx_direction() -> Coinbase candles
-    -> TradeManager.check() -> db.queries (N-2/N-4 lookups)
+         -> PatternStrategy.check_signal()
+              -> _fetch_candles() -> Coinbase candles API
+              -> _build_pattern_string() -> 6-char pattern
+              -> PATTERN_TABLE lookup
+              -> markets.get_next_slot_info() + get_slot_prices()
+                   -> Gamma API + CLOB API
+    -> TradeManager.check() -> always allowed=True (passthrough)
     -> trader.place_fok_order_with_retry() -> py-clob-client
     -> resolver.resolve_slot() -> Coinbase candles
     -> redeemer.scan_and_redeem() -> Data API + web3.py -> Polygon
@@ -411,3 +426,4 @@ APScheduler (every 5 min)
 Telegram
   -> handlers.py -> db.queries -> SQLite
   -> formatters.py (output formatting)
+```

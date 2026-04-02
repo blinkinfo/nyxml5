@@ -1,30 +1,50 @@
 """Pattern strategy -- 6-candle historical pattern matching on BTC-USD.
 
 Flow:
-1. Fetch 10 most recently closed 5-min BTC-USD candles from Coinbase
+1. Fetch the most recently *closed* 5-min BTC-USD candles from Coinbase
 2. Read directions of N-1 through N-6 (6 most recent fully closed)
 3. Build 6-char string (N-1 N-2 ... N-6, left to right) using U for up, D for down
 4. Look up string in pattern table
-5. If match -> trade Predicted direction for N+1 candle
+5. If match -> trade predicted direction for N+1 candle
 6. If no match -> skip
 
 Candle direction: close >= open means U (up), close < open means D (down).
+
+CANDLE TIMING SAFETY
+--------------------
+This strategy is called at T-85s (215s into a 300s slot).  At that moment the
+current 5-min candle is still open.  Coinbase's /candles endpoint returns only
+fully *closed* candles, BUT to be safe we always drop the most-recent candle
+returned by the API (it may be the still-open candle if the API races the
+clock-boundary) and work exclusively from the confirmed-closed set.
+See _fetch_candles() for the implementation detail.
 """
 
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import Any
 
 import config as cfg
 import httpx
+from core.strategies.base import BaseStrategy
 from polymarket.markets import get_next_slot_info, get_slot_prices
 
 log = logging.getLogger(__name__)
 
 
-# Pattern table: 6-char string -> predicted direction for N+1
-PATTERN_TABLE = {
+# ---------------------------------------------------------------------------
+# Pattern table
+# ---------------------------------------------------------------------------
+# Key format: 6-character string where each character represents one 5-min
+# BTC-USD candle direction.  Characters are ordered LEFT-TO-RIGHT as:
+#   [N-1][N-2][N-3][N-4][N-5][N-6]
+# where N-1 is the most-recently CLOSED candle and N-6 is the oldest.
+# U = close >= open (up), D = close < open (down).
+# Value = predicted direction for the NEXT candle (N+1): "UP" or "DOWN".
+
+PATTERN_TABLE: dict[str, str] = {
     "DDDDDD": "UP",
     "DUUUDU": "DOWN",
     "DUUUUD": "DOWN",
@@ -50,17 +70,30 @@ PATTERN_TABLE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 async def _fetch_candles(count: int = 10) -> list[dict[str, float]] | None:
-    """Fetch *count* most recently closed 5-min BTC-USD candles from Coinbase.
+    """Fetch the *count* most recently CONFIRMED-CLOSED 5-min BTC-USD candles.
 
-    Requests 300-candle window from Coinbase, returns the *count* most
-    recent fully closed candles (oldest first).
+    Implementation details
+    ----------------------
+    * Requests a 300-candle window (~25 h) from Coinbase so there is always
+      a large pool to draw from.
+    * Candles are sorted oldest-first after reversing the Coinbase response.
+    * We DROP the final candle in the sorted list (index -1) because at
+      T-85s the current 5-min slot is still open and Coinbase may include a
+      partially-formed candle at the tail.  Dropping it guarantees we only
+      work with fully closed candles.
+    * After the safety drop we return the *count* most recent candles
+      (oldest first), so callers get exactly what they asked for.
+
+    Returns None on network/parse failure.
     """
-    import time as _time
-
-    granularity = 300
+    granularity = 300  # 5 minutes in seconds
     end_ts = int(_time.time())
-    start_ts = end_ts - 300 * granularity
+    start_ts = end_ts - 300 * granularity  # ~25-hour window
 
     params = {
         "granularity": granularity,
@@ -78,42 +111,62 @@ async def _fetch_candles(count: int = 10) -> list[dict[str, float]] | None:
         return None
 
     if not raw or not isinstance(raw, list):
-        log.error("Coinbase returned empty or invalid response")
+        log.error("Coinbase returned empty or invalid candle response")
         return None
 
-    candles = []
+    candles: list[dict[str, float]] = []
     for row in raw:
         try:
             candles.append({
-                "time": float(row[0]),
-                "low":  float(row[1]),
-                "high": float(row[2]),
-                "open": float(row[3]),
+                "time":  float(row[0]),
+                "low":   float(row[1]),
+                "high":  float(row[2]),
+                "open":  float(row[3]),
                 "close": float(row[4]),
             })
         except (IndexError, ValueError, TypeError):
             continue
 
-    candles.reverse()
-    return candles
+    if not candles:
+        log.error("Coinbase candle response contained no parseable rows")
+        return None
+
+    # Sort oldest-first (Coinbase returns newest-first).
+    candles.sort(key=lambda c: c["time"])
+
+    # Drop the last candle: at T-85s the current 5-min slot is still open.
+    # The final entry from Coinbase *may* be a still-forming candle.  Removing
+    # it is cheap insurance against using dirty data in the pattern.
+    confirmed_closed = candles[:-1]
+
+    if len(confirmed_closed) < count:
+        log.warning(
+            "Not enough confirmed-closed candles: have %d, need %d",
+            len(confirmed_closed), count,
+        )
+        return None
+
+    # Return exactly `count` most-recent confirmed-closed candles, oldest first.
+    return confirmed_closed[-count:]
 
 
 def _build_pattern_string(candles: list[dict[str, float]], depth: int = 6) -> str | None:
-    """Build an *depth*-character pattern string from candle directions.
+    """Build a *depth*-character pattern string from candle directions.
 
-    Takes the *depth* most recent candles (index -depth to -1), oldest to
-    newest, and assigns U (close >= open) or D (close < open).
+    Expects *candles* sorted oldest-first.  Reads the last *depth* entries.
 
-    The returned string is left-to-right: most recent closed candle first,
-    then the one before it, etc.
+    Result character order (left to right):
+      position 0 = direction of candles[-1]  (N-1, most recent closed)
+      position 1 = direction of candles[-2]  (N-2)
+      ...
+      position 5 = direction of candles[-6]  (N-6, oldest in window)
 
-    So for depth=6 with candles list [oldest ... newest]:
-      result = direction(candles[-1]) + direction(candles[-2]) + ... + direction(candles[-6])
+    This matches the PATTERN_TABLE key format: [N-1][N-2][N-3][N-4][N-5][N-6].
     """
     if len(candles) < depth:
         log.warning(
-            "Not enough closed candles to build pattern: have %d, need %d",
-            len(candles), depth
+            "Not enough candles to build pattern: have %d, need %d",
+            len(candles), depth,
         )
         return None
 
@@ -126,68 +179,92 @@ def _build_pattern_string(candles: list[dict[str, float]], depth: int = 6) -> st
     return pattern
 
 
-class PatternStrategy:
-    """6-candle historical pattern matching strategy."""
+# ---------------------------------------------------------------------------
+# Strategy class
+# ---------------------------------------------------------------------------
+
+class PatternStrategy(BaseStrategy):
+    """6-candle historical pattern matching strategy.
+
+    Implements the BaseStrategy interface.  check_signal() is the sole public
+    method; it returns either:
+      - None                  on hard failure (network, parse error)
+      - {"skipped": True, ...}  when no pattern match
+      - {"skipped": False, ...} with full trade fields when a match is found
+    """
+
+    # Number of confirmed-closed candles to fetch from Coinbase.
+    # Must be >= PATTERN_DEPTH + 1 so the safety drop still leaves enough.
+    _CANDLE_FETCH_COUNT: int = 10
+
+    # Number of candles used to build the pattern string.
+    _PATTERN_DEPTH: int = 6
 
     async def check_signal(self) -> dict[str, Any] | None:
-        """Pattern-based signal for slot N+1.
+        """Generate a pattern-based signal for slot N+1.
 
-        1. Fetch 10 latest closed candles
-        2. Build 6-char pattern from N-1..N-6
-        3. Look up in pattern table
-        4. If match -> fetch Polymarket prices for token_id and entry_price
-        5. If no match -> skip
+        Called at T-85s before the current slot ends.
+
+        Steps:
+          1. Fetch confirmed-closed BTC-USD 5-min candles
+          2. Build 6-char pattern from the most recent 6 closed candles
+          3. Look up pattern in PATTERN_TABLE
+          4. On match: fetch Polymarket prices, return full signal dict
+          5. On no match: return skip dict (no trade placed)
         """
-        candles = await _fetch_candles(count=10)
+        candles = await _fetch_candles(count=self._CANDLE_FETCH_COUNT)
         if candles is None:
-            log.error("Pattern strategy: could not fetch candles")
+            log.error("PatternStrategy: candle fetch failed — aborting signal check")
             return None
 
-        pattern = _build_pattern_string(candles, depth=6)
+        pattern = _build_pattern_string(candles, depth=self._PATTERN_DEPTH)
         if pattern is None:
-            log.error("Pattern strategy: could not build pattern string")
+            log.error("PatternStrategy: could not build pattern string from %d candles", len(candles))
             return None
 
         prediction = PATTERN_TABLE.get(pattern)
+
+        # Always compute slot info (needed for both skip and trade paths).
+        slot_n1 = get_next_slot_info()
+
         if prediction is None:
-            slot_n1 = get_next_slot_info()
             log.info(
-                "Pattern strategy: pattern '%s' not in table -> SKIP",
-                pattern
+                "PatternStrategy: pattern '%s' not in table -> SKIP (slot %s-%s UTC)",
+                pattern,
+                slot_n1["slot_start_str"],
+                slot_n1["slot_end_str"],
             )
             return {
                 "skipped": True,
                 "pattern": pattern,
-                "candles_used": len(candles[-6:]) if len(candles) >= 6 else len(candles),
+                "candles_used": self._PATTERN_DEPTH,
                 "slot_n1_start_full": slot_n1["slot_start_full"],
-                "slot_n1_end_full": slot_n1["slot_end_full"],
-                "slot_n1_start_str": slot_n1["slot_start_str"],
-                "slot_n1_end_str": slot_n1["slot_end_str"],
-                "slot_n1_ts": slot_n1["slot_start_ts"],
+                "slot_n1_end_full":   slot_n1["slot_end_full"],
+                "slot_n1_start_str":  slot_n1["slot_start_str"],
+                "slot_n1_end_str":    slot_n1["slot_end_str"],
+                "slot_n1_ts":         slot_n1["slot_start_ts"],
             }
 
-        # Normalize prediction to "Up" or "Down"
+        # Normalize prediction to Polymarket-style side string.
         side = "Up" if prediction == "UP" else "Down"
 
-        # Fetch Polymarket prices for N+1 slot (needed for token_id and entry_price)
-        slot_n1 = get_next_slot_info()
+        # Fetch live Polymarket prices for N+1 slot.
         prices = await get_slot_prices(slot_n1["slug"])
         if prices is None:
             log.error(
-                "Pattern strategy: matched pattern '%s' -> %s but "
-                "could not fetch Polymarket prices for slot %s",
-                pattern, prediction, slot_n1["slug"]
+                "PatternStrategy: pattern '%s' -> %s matched but Polymarket price "
+                "fetch failed for slot %s — aborting signal",
+                pattern, prediction, slot_n1["slug"],
             )
             return None
 
-        # Use actual ask price from Polymarket as entry_price
-        entry_price = prices["up_price"] if side == "Up" else prices["down_price"]
-        opposite_price = prices["down_price"] if side == "Up" else prices["up_price"]
-        token_id = prices["up_token_id"] if side == "Up" else prices["down_token_id"]
+        entry_price    = prices["up_price"]    if side == "Up" else prices["down_price"]
+        opposite_price = prices["down_price"]  if side == "Up" else prices["up_price"]
+        token_id       = prices["up_token_id"] if side == "Up" else prices["down_token_id"]
 
         log.info(
-            "Pattern strategy: MATCH '%s' -> %s for slot %s-%s UTC  "
-            "entry=$%.4f (market ask)  token=%s",
+            "PatternStrategy: MATCH '%s' -> %s | slot %s-%s UTC | "
+            "entry=$%.4f | token=%s",
             pattern,
             prediction,
             slot_n1["slot_start_str"],
@@ -197,17 +274,17 @@ class PatternStrategy:
         )
 
         return {
-            "skipped": False,
-            "side": side,
-            "entry_price": entry_price,
-            "opposite_price": opposite_price,
-            "token_id": token_id,
-            "pattern": pattern,
-            "candles_used": len(candles[-6:]) if len(candles) >= 6 else len(candles),
+            "skipped":            False,
+            "side":               side,
+            "entry_price":        entry_price,
+            "opposite_price":     opposite_price,
+            "token_id":           token_id,
+            "pattern":            pattern,
+            "candles_used":       self._PATTERN_DEPTH,
             "slot_n1_start_full": slot_n1["slot_start_full"],
-            "slot_n1_end_full": slot_n1["slot_end_full"],
-            "slot_n1_start_str": slot_n1["slot_start_str"],
-            "slot_n1_end_str": slot_n1["slot_end_str"],
-            "slot_n1_ts": slot_n1["slot_start_ts"],
-            "slot_n1_slug": slot_n1["slug"],
+            "slot_n1_end_full":   slot_n1["slot_end_full"],
+            "slot_n1_start_str":  slot_n1["slot_start_str"],
+            "slot_n1_end_str":    slot_n1["slot_end_str"],
+            "slot_n1_ts":         slot_n1["slot_start_ts"],
+            "slot_n1_slug":       slot_n1["slug"],
         }
