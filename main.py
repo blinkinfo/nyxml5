@@ -105,7 +105,10 @@ def main() -> None:
     # 5. Run polling (blocks until stopped)
     #    Both scheduler and bot run in the same async event loop.
     log.info("Starting Telegram bot polling...")
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Exception as exc:
+        log.critical("Telegram bot exited: %s", exc)
 
 
 if __name__ == "__main__":

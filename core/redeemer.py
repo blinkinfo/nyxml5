@@ -236,18 +236,18 @@ def _redeem_position_sync(
         return {"success": False, "tx_hash": None, "error": str(exc), "gas_used": None}
 
     private_key = cfg.POLYMARKET_PRIVATE_KEY
-    funder = cfg.POLYMARKET_FUNDER_ADDRESS
-    if not private_key or not funder:
+    if not private_key:
         return {
             "success": False,
             "tx_hash": None,
-            "error": "POLYMARKET_PRIVATE_KEY or POLYMARKET_FUNDER_ADDRESS not set",
+            "error": "POLYMARKET_PRIVATE_KEY not set",
             "gas_used": None,
         }
 
     try:
         ctf = _get_ctf_contract(w3)
-        account = Web3.to_checksum_address(funder)
+        # Derive the transaction sender from the signing key to guarantee match.
+        account = w3.eth.account.from_key(private_key).address
         collateral = Web3.to_checksum_address(USDC_E_ADDRESS)
 
         # parentCollectionId = 0x00...00 (top-level condition)
