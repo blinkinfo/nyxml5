@@ -24,11 +24,11 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f4dc Redemptions", callback_data="cmd_redemptions"),
         ],
         [
+            InlineKeyboardButton("\U0001f9e9 Patterns", callback_data="cmd_patterns"),
             InlineKeyboardButton("\U0001f9ea Demo", callback_data="cmd_demo"),
-            InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
         ],
         [
-            InlineKeyboardButton("\U0001f522 Patterns", callback_data="cmd_patterns"),
+            InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
         ],
     ])
 
@@ -179,5 +179,17 @@ def pattern_filter_row() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("\U0001f4e5 Download Excel", callback_data="download_pattern_xlsx"),
         ],
+        [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Pattern performance keyboard
+# ---------------------------------------------------------------------------
+
+def pattern_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard for the /patterns dashboard."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f4e5 Download XLS", callback_data="download_pattern_xlsx")],
         [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
     ])
