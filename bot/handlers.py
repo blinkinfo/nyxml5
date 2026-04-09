@@ -611,6 +611,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await model_store.promote_candidate_in_db()
             except Exception:
                 log.exception("ml_promote_anyway: failed to persist promotion to DB (disk promote succeeded)")
+            # Inject the newly promoted model into the strategy before requesting reload
+            try:
+                promoted = await model_store.load_model_from_db("current")
+                if promoted:
+                    from core.strategies.ml_strategy import set_model
+                    set_model(promoted)
+            except Exception:
+                log.exception("ml_promote_anyway: failed to preload promoted model into strategy (non-fatal)")
             request_model_reload()
             meta = model_store.load_metadata("current") or {}
             threshold = await queries.get_ml_threshold()
@@ -1000,6 +1008,16 @@ async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await model_store.promote_candidate_in_db()
     except Exception:
         log.exception("cmd_promote_model: failed to persist promotion to DB (disk promote succeeded)")
+    # Inject the newly promoted model into the strategy before requesting reload,
+    # so _load_model() picks it up from memory rather than falling back to disk
+    # (disk is ephemeral on Railway and may not have the model after a redeploy).
+    try:
+        promoted = await model_store.load_model_from_db("current")
+        if promoted:
+            from core.strategies.ml_strategy import set_model
+            set_model(promoted)
+    except Exception:
+        log.exception("cmd_promote_model: failed to preload promoted model into strategy (non-fatal)")
     request_model_reload()
     meta = model_store.load_metadata("current")
     threshold = await queries.get_ml_threshold()
