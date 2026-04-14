@@ -12,6 +12,62 @@ def _e(value: object) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Risk table helpers — module-level so both retrain formatters share them.
+# All formatters produce fixed-width strings for use inside <code> blocks,
+# which Telegram renders in monospace.  Consistent widths keep the │ separator
+# column-aligned regardless of value magnitude.
+# ---------------------------------------------------------------------------
+
+def _risk_dd_dollar(v: float) -> str:
+    """Format a drawdown dollar value to a fixed 7-char field.
+
+    Examples:  -$3.50  ->  '-$3.50 '   $0.00  ->  '$0.00  '
+    Negative values render as '-$X.XX', zero/positive as '$0.00'.
+    Field width 7 accommodates up to -$99.99 without overflow.
+    """
+    s = f"-${abs(v):.2f}" if v < 0 else "$0.00"
+    return s.ljust(7)
+
+
+def _risk_dd_pct(v: float) -> str:
+    """Format a drawdown percentage to a fixed 7-char field.
+
+    Examples:  -12.3%  ->  '-12.3% '   0.0%  ->  '0.0%   '
+    Field width 7 accommodates up to -99.9% without overflow.
+    """
+    s = f"{v:.1f}%" if v < 0 else "0.0%"
+    return s.ljust(7)
+
+
+def _risk_streak(v: int) -> str:
+    """Format a streak integer to a fixed 7-char field.
+
+    All risk value helpers share the same field width (7) so that a single
+    space after the value always places the │ separator at the same column.
+
+    Examples:  7  ->  '7      '   12  ->  '12     '
+    """
+    return str(v).ljust(7)
+
+
+def _risk_pf(v: float) -> str:
+    """Format a profit factor to a fixed 7-char field.
+
+    Examples:  1.23  ->  '1.23   '   inf  ->  '∞      '
+    """
+    s = "\u221e" if v == float("inf") else f"{v:.2f}"
+    return s.ljust(7)
+
+
+def _risk_sharpe(v: float) -> str:
+    """Format a Sharpe ratio to a fixed 7-char field.
+
+    Examples:  1.23  ->  '1.23   '   -0.45  ->  '-0.45  '
+    """
+    return f"{v:.2f}".ljust(7)
+
+
+# ---------------------------------------------------------------------------
 # Consistent separator
 # ---------------------------------------------------------------------------
 
@@ -852,33 +908,43 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
             "\u2502   Not validated\n"
         )
 
-    # Risk block — val vs test columns
+    # Risk block — monospace <code> table, Val | Test columns, fixed-width padding
     val_risk  = meta.get("val_risk", {})
     test_risk = meta.get("test_risk", {})
     wf_dd_d   = meta.get("wf_worst_dd_dollar", 0.0)
     wf_dd_pct = meta.get("wf_worst_dd_pct", 0.0)
     wf_ls     = meta.get("wf_worst_loss_streak", 0)
 
-    def _dd_str(v: float) -> str:
-        return f"-${abs(v):.2f}" if v < 0 else "$0.00"
-
-    def _pct_str(v: float) -> str:
-        return f"{v:.1f}%" if v < 0 else "0.0%"
-
-    def _pf_str(v: float) -> str:
-        return "\u221e" if v == float("inf") else f"{v:.2f}"
-
     if val_risk or test_risk:
+        # Column layout (monospace) — identical to format_retrain_complete.
+        # All val fields normalised to 7 chars so │ always lands at col 23.
+        v_dd_d  = _risk_dd_dollar(val_risk.get("max_dd_dollar", 0.0))
+        t_dd_d  = _risk_dd_dollar(test_risk.get("max_dd_dollar", 0.0))
+        v_dd_p  = _risk_dd_pct(val_risk.get("max_dd_pct", 0.0))
+        t_dd_p  = _risk_dd_pct(test_risk.get("max_dd_pct", 0.0))
+        v_ls    = _risk_streak(val_risk.get("max_loss_streak", 0))
+        t_ls    = _risk_streak(test_risk.get("max_loss_streak", 0))
+        v_ws    = _risk_streak(val_risk.get("max_win_streak", 0))
+        t_ws    = _risk_streak(test_risk.get("max_win_streak", 0))
+        v_pf    = _risk_pf(val_risk.get("profit_factor", 0.0))
+        t_pf    = _risk_pf(test_risk.get("profit_factor", 0.0))
+        v_sh    = _risk_sharpe(val_risk.get("sharpe", 0.0))
+        t_sh    = _risk_sharpe(test_risk.get("sharpe", 0.0))
+        wf_d    = _risk_dd_dollar(wf_dd_d)
+        wf_p    = _risk_dd_pct(wf_dd_pct)
         risk_section = (
             "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-            "\u2502 \u26a0\ufe0f <b>Risk</b>  (Val  \u2502  Test)\n"
-            f"\u2502  Max DD $      {_dd_str(val_risk.get('max_dd_dollar', 0.0))}  \u2502  {_dd_str(test_risk.get('max_dd_dollar', 0.0))}\n"
-            f"\u2502  Max DD %      {_pct_str(val_risk.get('max_dd_pct', 0.0))}  \u2502  {_pct_str(test_risk.get('max_dd_pct', 0.0))}\n"
-            f"\u2502  Loss streak   {val_risk.get('max_loss_streak', 0)}  \u2502  {test_risk.get('max_loss_streak', 0)}\n"
-            f"\u2502  Win streak    {val_risk.get('max_win_streak', 0)}  \u2502  {test_risk.get('max_win_streak', 0)}\n"
-            f"\u2502  Profit factor {_pf_str(val_risk.get('profit_factor', 0.0))}  \u2502  {_pf_str(test_risk.get('profit_factor', 0.0))}\n"
-            f"\u2502  Sharpe        {val_risk.get('sharpe', 0.0):.2f}  \u2502  {test_risk.get('sharpe', 0.0):.2f}\n"
-            f"\u2502  WF worst DD   {_dd_str(wf_dd_d)}  ({_pct_str(wf_dd_pct)})  \u2022  loss streak {wf_ls}\n"
+            "\u2502 \u26a0\ufe0f <b>Risk</b>\n"
+            "\u2502 <code>"
+            "Metric         Val     \u2502 Test   \n"
+            f"Max DD $       {v_dd_d} \u2502 {t_dd_d}\n"
+            f"Max DD %       {v_dd_p} \u2502 {t_dd_p}\n"
+            f"Loss streak    {v_ls} \u2502 {t_ls}\n"
+            f"Win streak     {v_ws} \u2502 {t_ws}\n"
+            f"Profit factor  {v_pf} \u2502 {t_pf}\n"
+            f"Sharpe         {v_sh} \u2502 {t_sh}\n"
+            f"WF worst DD    {wf_d} ({wf_p}) streak {wf_ls}"
+            "</code>\n"
         )
     else:
         risk_section = ""
@@ -951,33 +1017,49 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
             "\u2502   Not validated\n"
         )
 
-    # Risk block — val vs test columns
+    # Risk block — monospace <code> table, Val | Test columns, fixed-width padding
     val_risk  = meta.get("val_risk", {})
     test_risk = meta.get("test_risk", {})
     wf_dd_d   = meta.get("wf_worst_dd_dollar", 0.0)
     wf_dd_pct = meta.get("wf_worst_dd_pct", 0.0)
     wf_ls     = meta.get("wf_worst_loss_streak", 0)
 
-    def _dd_str(v: float) -> str:
-        return f"-${abs(v):.2f}" if v < 0 else "$0.00"
-
-    def _pct_str(v: float) -> str:
-        return f"{v:.1f}%" if v < 0 else "0.0%"
-
-    def _pf_str(v: float) -> str:
-        return "\u221e" if v == float("inf") else f"{v:.2f}"
-
     if val_risk or test_risk:
+        # Each value is padded to a fixed width so the │ separator is always
+        # in the same column position when rendered in Telegram monospace.
+        v_dd_d  = _risk_dd_dollar(val_risk.get("max_dd_dollar", 0.0))
+        t_dd_d  = _risk_dd_dollar(test_risk.get("max_dd_dollar", 0.0))
+        v_dd_p  = _risk_dd_pct(val_risk.get("max_dd_pct", 0.0))
+        t_dd_p  = _risk_dd_pct(test_risk.get("max_dd_pct", 0.0))
+        v_ls    = _risk_streak(val_risk.get("max_loss_streak", 0))
+        t_ls    = _risk_streak(test_risk.get("max_loss_streak", 0))
+        v_ws    = _risk_streak(val_risk.get("max_win_streak", 0))
+        t_ws    = _risk_streak(test_risk.get("max_win_streak", 0))
+        v_pf    = _risk_pf(val_risk.get("profit_factor", 0.0))
+        t_pf    = _risk_pf(test_risk.get("profit_factor", 0.0))
+        v_sh    = _risk_sharpe(val_risk.get("sharpe", 0.0))
+        t_sh    = _risk_sharpe(test_risk.get("sharpe", 0.0))
+        wf_d    = _risk_dd_dollar(wf_dd_d)
+        wf_p    = _risk_dd_pct(wf_dd_pct)
+        # Column layout (monospace):
+        # "Metric         " = 15 chars (label column, ljust to longest label)
+        # val value        = 7 chars (all helpers pad to 7)
+        # " │ "            = separator (1 space each side)
+        # test value       = 7 chars
+        # │ always lands at position 15 + 7 + 1 = 23 in every row.
         risk_section = (
             "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-            "\u2502 \u26a0\ufe0f <b>Risk</b>  (Val  \u2502  Test)\n"
-            f"\u2502  Max DD $      {_dd_str(val_risk.get('max_dd_dollar', 0.0))}  \u2502  {_dd_str(test_risk.get('max_dd_dollar', 0.0))}\n"
-            f"\u2502  Max DD %      {_pct_str(val_risk.get('max_dd_pct', 0.0))}  \u2502  {_pct_str(test_risk.get('max_dd_pct', 0.0))}\n"
-            f"\u2502  Loss streak   {val_risk.get('max_loss_streak', 0)}  \u2502  {test_risk.get('max_loss_streak', 0)}\n"
-            f"\u2502  Win streak    {val_risk.get('max_win_streak', 0)}  \u2502  {test_risk.get('max_win_streak', 0)}\n"
-            f"\u2502  Profit factor {_pf_str(val_risk.get('profit_factor', 0.0))}  \u2502  {_pf_str(test_risk.get('profit_factor', 0.0))}\n"
-            f"\u2502  Sharpe        {val_risk.get('sharpe', 0.0):.2f}  \u2502  {test_risk.get('sharpe', 0.0):.2f}\n"
-            f"\u2502  WF worst DD   {_dd_str(wf_dd_d)}  ({_pct_str(wf_dd_pct)})  \u2022  loss streak {wf_ls}\n"
+            "\u2502 \u26a0\ufe0f <b>Risk</b>\n"
+            "\u2502 <code>"
+            "Metric         Val     \u2502 Test   \n"
+            f"Max DD $       {v_dd_d} \u2502 {t_dd_d}\n"
+            f"Max DD %       {v_dd_p} \u2502 {t_dd_p}\n"
+            f"Loss streak    {v_ls} \u2502 {t_ls}\n"
+            f"Win streak     {v_ws} \u2502 {t_ws}\n"
+            f"Profit factor  {v_pf} \u2502 {t_pf}\n"
+            f"Sharpe         {v_sh} \u2502 {t_sh}\n"
+            f"WF worst DD    {wf_d} ({wf_p}) streak {wf_ls}"
+            "</code>\n"
         )
     else:
         risk_section = ""

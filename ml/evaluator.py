@@ -166,9 +166,20 @@ def compute_risk_metrics(
     drawdown = equity - peak                            # always <= 0
     max_dd_dollar = float(np.min(drawdown))            # most negative value
 
-    # Percentage drawdown: drawdown / peak — guard against peak == 0
-    # Use absolute peak so we handle cases where equity never goes positive.
-    # When peak == 0 at a trough, define pct drawdown as 0 (no capital at risk).
+    # Percentage drawdown: drawdown / peak — guard against peak == 0.
+    #
+    # Design choice: when the running peak is 0 (i.e. equity has never risen
+    # above the starting value of 0), we define the percentage drawdown as 0.0
+    # at that point rather than divide-by-zero.  This arises in two cases:
+    #   1. The very first trade(s) are losses — peak stays at 0.0 while equity
+    #      goes negative, so there is no positive capital base to express the
+    #      drawdown against.
+    #   2. An all-losing sequence — peak never exceeds 0.0 throughout.
+    #
+    # Consequence: on sequences that open with losses, max_dd_pct will be
+    # 0.0% even though max_dd_dollar is negative.  The dollar figure is the
+    # authoritative risk measure in that scenario; the percentage figure is
+    # intentionally suppressed to avoid a misleading division artefact.
     with np.errstate(invalid="ignore", divide="ignore"):
         dd_pct = np.where(peak > 0, drawdown / peak * 100.0, 0.0)
     max_dd_pct = float(np.min(dd_pct))                 # most negative %

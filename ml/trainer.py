@@ -199,7 +199,6 @@ def sweep_threshold(
                     best_ev = ev
                     best_threshold = thresh
                     best_wr = wr
-                    _best_trades = trades
                     best_trades_per_day = tpd
             thresh = round(thresh + step, 4)
         log.warning(
@@ -637,10 +636,20 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         _data_end   = None
 
     # Payout-adjusted EV/day for UP and DOWN sides (per $1 flat stake).
-    # These are the realised test-set values using the final threshold, not
-    # the sweep-time estimates, so they reflect actual hold-out performance.
-    _up_ev_per_day   = float(test_metrics.get("ev_per_day", 0.0))
-    _down_ev_per_day = float(down_test_metrics.get("ev_per_day", 0.0))
+    # Computed inline from test-set WR and trades_per_day — evaluate_at_threshold()
+    # does not return ev_per_day, so we must derive it here rather than reading
+    # a missing key (which would silently produce 0.0).
+    # Formula: EV/trade = WR * (1 + payout) - 1.0;  EV/day = EV/trade * tpd
+    _up_ev_per_day   = _ev_per_day(
+        test_metrics["wr"],
+        test_metrics["trades_per_day"],
+        ML_PAYOUT_RATIO,
+    )
+    _down_ev_per_day = _ev_per_day(
+        down_test_metrics["wr"],
+        down_test_metrics["trades_per_day"],
+        ML_PAYOUT_RATIO,
+    )
 
     # -----------------------------------------------------------------------
     # Risk metrics — flat-bet equity curve simulation on val and test sets.
