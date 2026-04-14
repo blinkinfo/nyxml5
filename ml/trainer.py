@@ -624,8 +624,28 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
 
     # Save model and metadata to candidate slot regardless of gate result.
     # The caller decides what to do with a blocked candidate.
+
+    # Data date range — derived from the feature DataFrame's timestamp column.
+    # Stored as ISO strings (UTC) so formatters can display the training window.
+    _ts_col = df_features["timestamp"] if "timestamp" in df_features.columns else None
+    if _ts_col is not None and len(_ts_col) > 0:
+        _data_start = pd.Timestamp(_ts_col.iloc[0]).isoformat()[:10]
+        _data_end   = pd.Timestamp(_ts_col.iloc[-1]).isoformat()[:10]
+    else:
+        _data_start = None
+        _data_end   = None
+
+    # Payout-adjusted EV/day for UP and DOWN sides (per $1 flat stake).
+    # These are the realised test-set values using the final threshold, not
+    # the sweep-time estimates, so they reflect actual hold-out performance.
+    _up_ev_per_day   = float(test_metrics.get("ev_per_day", 0.0))
+    _down_ev_per_day = float(down_test_metrics.get("ev_per_day", 0.0))
+
     metadata = {
         "train_date": datetime.utcnow().isoformat(),
+        # Data window used for training
+        "data_start": _data_start,
+        "data_end": _data_end,
         # UP side — threshold is WFV-derived (median across folds), val_wr is reference only
         "threshold": best_threshold,
         "threshold_source": "walk_forward_validation_median",
@@ -635,6 +655,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "test_precision": test_metrics["precision"],
         "test_trades": test_metrics["trades"],
         "test_trades_per_day": test_metrics["trades_per_day"],
+        "up_ev_per_day": _up_ev_per_day,
         # DOWN side — independently swept and validated
         "down_threshold": down_threshold,
         "down_enabled": down_enabled,
@@ -643,6 +664,9 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "down_test_wr": down_test_metrics["wr"],
         "down_test_trades": down_test_metrics["trades"],
         "down_test_tpd": down_test_metrics["trades_per_day"],
+        "down_ev_per_day": _down_ev_per_day,
+        # Payout ratio used for EV computation (from config, env-overridable)
+        "payout": ML_PAYOUT_RATIO,
         # Walk-forward validation summary
         "wf_avg_wr": wf_results["avg_wr"],
         "wf_std_wr": wf_results["std_wr"],

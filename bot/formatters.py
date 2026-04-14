@@ -814,17 +814,37 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
     down_test_wr = meta.get("down_test_wr")
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
 
-    up_test_wr   = meta.get("test_wr", 0)
+    up_test_wr    = meta.get("test_wr", 0)
     shortfall     = round((up_test_wr - _GATE) * 100, 1)   # always negative here
     shortfall_str = f"{shortfall:+.1f}%"                   # e.g. "-2.2%"
 
+    # Data date range (ISO date strings, e.g. "2025-11-14")
+    data_start = meta.get("data_start")
+    data_end   = meta.get("data_end")
+    if data_start and data_end:
+        data_line = f"\u2502 \U0001f5d3 Data:     {_e(data_start)} \u2192 {_e(data_end)}\n"
+    else:
+        data_line = ""
+
+    # Payout ratio
+    payout     = meta.get("payout", 0.85)
+    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
+
+    # UP EV/day
+    up_ev      = meta.get("up_ev_per_day", 0.0)
+    up_ev_str  = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
+
+    # DOWN section
     if down_val_wr is not None and down_test_wr is not None:
         down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
         down_status_icon = "\u2705" if down_enabled else "\u26d4"
+        down_ev     = meta.get("down_ev_per_day", 0.0)
+        down_ev_str = f"{down_ev:+.2f}" if down_ev != 0.0 else "N/A"
         down_section = (
             f"\u2502 \u2193 DOWN Side              {down_status_icon} {down_status_lbl}\n"
             f"\u2502   Val  {down_val_wr*100:.1f}%  /  Test  {down_test_wr*100:.1f}%\n"
             f"\u2502   Threshold \u2265 {down_thr*100:.1f}%  \u2022  {down_tpd:.1f} trades/day\n"
+            f"\u2502   EV/day  {down_ev_str}\n"
         )
     else:
         down_section = (
@@ -837,14 +857,18 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \U0001f4c5 Trained:  {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
         f"\u2502 \U0001f4ca Samples:  {meta.get('sample_count', 0):,}\n"
+        f"{data_line}"
+        f"{payout_line}"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \u2191 UP Side        \u274c Gate failed  {shortfall_str}\n"
-        f"\u2502   Val  {meta.get('val_wr', 0)*100:.1f}%  /  Test  {up_test_wr*100:.1f}%  (min {_GATE*100:.1f}%)\n"
+        f"\u2502 \u2191 UP Side        \u274c FAILED  {shortfall_str} below gate\n"
+        f"\u2502   Val  {meta.get('val_wr', 0)*100:.1f}%  /  Test  {up_test_wr*100:.1f}%  (need \u2265 {_GATE*100:.1f}%)\n"
         f"\u2502   Threshold \u2265 {threshold*100:.1f}%  \u2022  {meta.get('test_trades_per_day', 0):.1f} trades/day\n"
+        f"\u2502   EV/day  {up_ev_str}\n"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"{down_section}"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        "Candidate saved. Not auto-promoted."
+        "Candidate saved \u2014 not live.\n"
+        "/model to compare  \u2022  /promote_model to override gate"
     )
 
 
@@ -857,17 +881,37 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
     down_test_wr = meta.get("down_test_wr")
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
 
-    up_test_wr  = meta.get("test_wr", 0)
-    up_margin   = round((up_test_wr - _GATE) * 100, 1)
+    up_test_wr    = meta.get("test_wr", 0)
+    up_margin     = round((up_test_wr - _GATE) * 100, 1)
     up_margin_str = f"+{up_margin:.1f}%" if up_margin >= 0 else f"{up_margin:.1f}%"
 
+    # Data date range (ISO date strings, e.g. "2025-11-14")
+    data_start = meta.get("data_start")
+    data_end   = meta.get("data_end")
+    if data_start and data_end:
+        data_line = f"\u2502 \U0001f5d3 Data:     {_e(data_start)} \u2192 {_e(data_end)}\n"
+    else:
+        data_line = ""
+
+    # Payout ratio
+    payout      = meta.get("payout", 0.85)
+    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
+
+    # UP EV/day
+    up_ev     = meta.get("up_ev_per_day", 0.0)
+    up_ev_str = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
+
+    # DOWN section
     if down_val_wr is not None and down_test_wr is not None:
         down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
         down_status_icon = "\u2705" if down_enabled else "\u26d4"
+        down_ev     = meta.get("down_ev_per_day", 0.0)
+        down_ev_str = f"{down_ev:+.2f}" if down_ev != 0.0 else "N/A"
         down_section = (
             f"\u2502 \u2193 DOWN Side              {down_status_icon} {down_status_lbl}\n"
             f"\u2502   Val  {down_val_wr*100:.1f}%  /  Test  {down_test_wr*100:.1f}%\n"
             f"\u2502   Threshold \u2265 {down_thr*100:.1f}%  \u2022  {down_tpd:.1f} trades/day\n"
+            f"\u2502   EV/day  {down_ev_str}\n"
         )
     else:
         down_section = (
@@ -880,13 +924,17 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \U0001f4c5 Trained:  {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
         f"\u2502 \U0001f4ca Samples:  {meta.get('sample_count', 0):,}\n"
+        f"{data_line}"
+        f"{payout_line}"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \u2191 UP Side        \u2705 Gate passed  {up_margin_str}\n"
         f"\u2502   Val  {meta.get('val_wr', 0)*100:.1f}%  /  Test  {up_test_wr*100:.1f}%  (min {_GATE*100:.1f}%)\n"
         f"\u2502   Threshold \u2265 {threshold*100:.1f}%  \u2022  {meta.get('test_trades_per_day', 0):.1f} trades/day\n"
+        f"\u2502   EV/day  {up_ev_str}\n"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"{down_section}"
-        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "Use /promote_model to deploy  \u2022  /model to compare"
     )
 
 
