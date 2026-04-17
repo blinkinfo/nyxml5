@@ -6,7 +6,6 @@ Uses get_next_slot_info() + get_slot_prices() exactly as PatternStrategy does.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timezone
@@ -272,7 +271,7 @@ class MLStrategy(BaseStrategy):
             )
             return
 
-        models, meta = asyncio.run(model_store.load_model_bundle_for_runtime("current"))
+        models, meta = model_store.load_model_bundle_for_runtime_sync("current")
         self._models, normalized_meta = _normalize_runtime_bundle(models, meta)
         self._model_meta = normalized_meta
         self._model_slot = normalized_meta.get("slot", "current")

@@ -214,39 +214,54 @@ def save_model_bundle(models: dict[str, lgb.Booster], slot: str, metadata: dict)
     log.info("save_model_bundle: saved slot=%s keys=%s", slot, sorted(models.keys()))
 
 
-async def load_model_bundle_for_runtime(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
-    """Load the runtime bundle from the canonical source for the slot.
-
-    The current slot is promoted into the DB and preloaded into strategy memory, so
-    runtime reloads should prefer the DB-backed copy to avoid bouncing between a
-    fresher DB artifact and a stale on-disk artifact. Other slots keep the existing
-    disk-first behavior, and current still falls back to disk for backward
-    compatibility when no DB row exists.
-    """
-    if slot == "current":
-        db_models, db_meta = await load_model_bundle_from_db(slot)
-        if db_models and db_meta:
-            log.info(
-                "load_model_bundle_for_runtime: slot=%s source=db artifact_format=%s artifact_version=%s down_enabled=%s model_keys=%s",
-                slot,
-                db_meta.get("format"),
-                db_meta.get("artifact_version") or db_meta.get("bundle_version"),
-                db_meta.get("down_enabled"),
-                sorted(db_models.keys()),
-            )
-            return db_models, db_meta
-        log.info("load_model_bundle_for_runtime: slot=%s source=db_miss -> fallback=disk", slot)
-
-    models, meta = load_model_bundle(slot)
+def _log_runtime_loader_result(slot: str, source: str, models: dict[str, lgb.Booster] | None, meta: dict | None) -> None:
     if models and meta:
         log.info(
-            "load_model_bundle_for_runtime: slot=%s source=disk artifact_format=%s artifact_version=%s down_enabled=%s model_keys=%s",
+            "load_model_bundle_for_runtime: slot=%s source=%s artifact_format=%s artifact_version=%s down_enabled=%s model_keys=%s",
             slot,
+            source,
             meta.get("format"),
             meta.get("artifact_version") or meta.get("bundle_version"),
             meta.get("down_enabled"),
             sorted(models.keys()),
         )
+
+
+async def load_model_bundle_for_runtime(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
+    """Async runtime bundle loader preserving DB-first current-slot semantics."""
+    if slot == "current":
+        db_models, db_meta = await load_model_bundle_from_db(slot)
+        if db_models and db_meta:
+            _log_runtime_loader_result(slot, "db", db_models, db_meta)
+            return db_models, db_meta
+        log.info("load_model_bundle_for_runtime: slot=%s source=db_miss -> fallback=disk", slot)
+
+    models, meta = load_model_bundle(slot)
+    _log_runtime_loader_result(slot, "disk", models, meta)
+    return models, meta
+
+
+def load_model_bundle_for_runtime_sync(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
+    """Synchronous runtime bundle loader for sync callers such as MLStrategy.
+
+    The current slot prefers the DB-backed artifact when available, matching the
+    async runtime loader used by async callers. This avoids calling asyncio.run()
+    from already-running event loops while preserving the DB-first current-slot
+    behavior and disk fallback semantics.
+    """
+    if slot == "current":
+        try:
+            db_models, db_meta = load_model_bundle_from_db_sync(slot)
+        except Exception:
+            log.exception("load_model_bundle_for_runtime_sync: slot=%s source=db failed -> fallback=disk", slot)
+        else:
+            if db_models and db_meta:
+                _log_runtime_loader_result(slot, "db", db_models, db_meta)
+                return db_models, db_meta
+            log.info("load_model_bundle_for_runtime: slot=%s source=db_miss -> fallback=disk", slot)
+
+    models, meta = load_model_bundle(slot)
+    _log_runtime_loader_result(slot, "disk", models, meta)
     return models, meta
 
 
@@ -430,6 +445,59 @@ def patch_metadata(slot: str, updates: dict) -> None:
         log.info("patch_metadata: patched slot=%s keys=%s", slot, list(updates.keys()))
     except Exception as e:
         log.error("patch_metadata: failed to write %s: %s", path, e)
+
+
+def load_model_bundle_from_db_sync(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
+    """Load a model bundle from SQLite synchronously, supporting legacy rows."""
+    import sqlite3
+    import config as cfg
+
+    with sqlite3.connect(cfg.DB_PATH) as db:
+        row = db.execute(
+            "SELECT blob, metadata FROM model_blobs WHERE slot = ?",
+            (slot,),
+        ).fetchone()
+
+    if not row:
+        log.info("load_model_bundle_from_db: no blob found for slot=%s", slot)
+        return None, None
+
+    blob, meta_json = row
+    metadata = None
+    try:
+        metadata = _normalize_bundle_metadata(json.loads(meta_json), slot=slot) if meta_json else None
+    except Exception as e:
+        log.error("load_model_bundle_from_db: bad metadata for slot=%s: %s", slot, e)
+
+    try:
+        payload = json.loads(blob.decode("utf-8"))
+        if payload.get("artifact_version", 1) >= 2 and isinstance(payload.get("models"), dict):
+            models: dict[str, lgb.Booster] = {}
+            for model_key in MODEL_KEYS:
+                model_hex = payload["models"].get(model_key)
+                if not model_hex:
+                    log.error("load_model_bundle_from_db: missing %s model in slot=%s", model_key, slot)
+                    return None, None
+                models[model_key] = _deserialize_model(bytes.fromhex(model_hex), slot, "load_model_bundle_from_db", model_key)
+                if models[model_key] is None:
+                    return None, None
+            if metadata is None:
+                metadata = _normalize_bundle_metadata({}, slot=slot)
+            log.info("load_model_bundle_from_db: loaded dual bundle slot=%s (%d bytes)", slot, len(blob))
+            return models, metadata
+    except Exception:
+        pass
+
+    legacy_model = _deserialize_model(blob, slot, "load_model_from_db", "up")
+    if legacy_model is None:
+        return None, None
+    models = _extract_legacy_model(metadata, legacy_model)
+    if models is None:
+        return None, None
+    if metadata is None:
+        metadata = _normalize_bundle_metadata({}, slot=slot)
+    log.info("load_model_bundle_from_db: loaded legacy single-model slot=%s (%d bytes)", slot, len(blob))
+    return models, metadata
 
 
 async def load_model_bundle_from_db(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:

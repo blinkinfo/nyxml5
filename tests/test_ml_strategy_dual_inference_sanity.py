@@ -250,15 +250,15 @@ def test_reload_prefers_canonical_current_bundle_over_stale_disk_legacy_artifact
         "down_enabled": True,
     }
 
-    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime
+    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime_sync
     orig_preloaded = strategy_mod._PRELOADED_MODEL_BUNDLE
     orig_reload_requested = strategy_mod._RELOAD_REQUESTED
 
-    async def fake_runtime_loader(slot):
+    def fake_runtime_loader(slot):
         assert slot == "current"
         return fresh_dual_models, fresh_dual_meta
 
-    strategy_mod.model_store.load_model_bundle_for_runtime = fake_runtime_loader
+    strategy_mod.model_store.load_model_bundle_for_runtime_sync = fake_runtime_loader
     strategy_mod._PRELOADED_MODEL_BUNDLE = {
         "models": {"up": DummyBooster(0.58), "down": DummyBooster(0.41)},
         "metadata": fresh_dual_meta,
@@ -279,12 +279,12 @@ def test_reload_prefers_canonical_current_bundle_over_stale_disk_legacy_artifact
         assert s._models is not None and s._models["up"].predict(None) == [0.61]
         assert s._models["down"].predict(None) == [0.73]
     finally:
-        strategy_mod.model_store.load_model_bundle_for_runtime = orig_runtime_loader
+        strategy_mod.model_store.load_model_bundle_for_runtime_sync = orig_runtime_loader
         strategy_mod._PRELOADED_MODEL_BUNDLE = orig_preloaded
         strategy_mod._RELOAD_REQUESTED = orig_reload_requested
 
 
-def test_runtime_current_bundle_loader_prefers_db_but_falls_back_to_disk():
+def test_runtime_current_bundle_loader_sync_prefers_db_but_falls_back_to_disk():
     import ml.model_store as store
 
     db_models = {"up": DummyBooster(0.61), "down": DummyBooster(0.73)}
@@ -292,10 +292,10 @@ def test_runtime_current_bundle_loader_prefers_db_but_falls_back_to_disk():
     disk_models = {"up": DummyBooster(0.52), "down": DummyBooster(0.52)}
     disk_meta = {"slot": "current", "threshold": 0.55}
 
-    orig_db_loader = store.load_model_bundle_from_db
+    orig_db_loader = store.load_model_bundle_from_db_sync
     orig_disk_loader = store.load_model_bundle
 
-    async def fake_db_loader(slot):
+    def fake_db_loader(slot):
         assert slot == "current"
         return db_models, db_meta
 
@@ -303,23 +303,23 @@ def test_runtime_current_bundle_loader_prefers_db_but_falls_back_to_disk():
         assert slot == "current"
         return disk_models, disk_meta
 
-    store.load_model_bundle_from_db = fake_db_loader
+    store.load_model_bundle_from_db_sync = fake_db_loader
     store.load_model_bundle = fake_disk_loader
     try:
-        models, meta = asyncio.run(store.load_model_bundle_for_runtime("current"))
+        models, meta = store.load_model_bundle_for_runtime_sync("current")
         assert models is db_models
         assert meta is db_meta
 
-        async def fake_missing_db_loader(slot):
+        def fake_missing_db_loader(slot):
             assert slot == "current"
             return None, None
 
-        store.load_model_bundle_from_db = fake_missing_db_loader
-        models, meta = asyncio.run(store.load_model_bundle_for_runtime("current"))
+        store.load_model_bundle_from_db_sync = fake_missing_db_loader
+        models, meta = store.load_model_bundle_for_runtime_sync("current")
         assert models is disk_models
         assert meta is disk_meta
     finally:
-        store.load_model_bundle_from_db = orig_db_loader
+        store.load_model_bundle_from_db_sync = orig_db_loader
         store.load_model_bundle = orig_disk_loader
 
 
@@ -462,15 +462,15 @@ def test_load_model_logs_structured_runtime_diagnostics_for_preloaded_and_reload
         "inference_mode": "dual",
     }
 
-    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime
+    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime_sync
     orig_preloaded = strategy_mod._PRELOADED_MODEL_BUNDLE
     orig_reload_requested = strategy_mod._RELOAD_REQUESTED
 
-    async def fake_runtime_loader(slot):
+    def fake_runtime_loader(slot):
         assert slot == "current"
         return fresh_dual_models, fresh_dual_meta
 
-    strategy_mod.model_store.load_model_bundle_for_runtime = fake_runtime_loader
+    strategy_mod.model_store.load_model_bundle_for_runtime_sync = fake_runtime_loader
     strategy_mod._PRELOADED_MODEL_BUNDLE = {
         "models": {"up": DummyBooster(0.58), "down": DummyBooster(0.41)},
         "metadata": fresh_dual_meta,
@@ -482,7 +482,7 @@ def test_load_model_logs_structured_runtime_diagnostics_for_preloaded_and_reload
         strategy_mod._RELOAD_REQUESTED = True
         s._load_model()
     finally:
-        strategy_mod.model_store.load_model_bundle_for_runtime = orig_runtime_loader
+        strategy_mod.model_store.load_model_bundle_for_runtime_sync = orig_runtime_loader
         strategy_mod._PRELOADED_MODEL_BUNDLE = orig_preloaded
         strategy_mod._RELOAD_REQUESTED = orig_reload_requested
 
@@ -495,3 +495,60 @@ def test_load_model_logs_structured_runtime_diagnostics_for_preloaded_and_reload
     assert "models_are_distinct=True" in msg
     assert "runtime_down_source=down_model" in msg
     assert "inconsistencies=[]" in msg
+
+
+def test_load_model_uses_sync_runtime_loader_inside_active_event_loop():
+    import core.strategies.ml_strategy as strategy_mod
+
+    s = MLStrategy.__new__(MLStrategy)
+    s._models = None
+    s._model_meta = {}
+    s._funding_buffer = deque(maxlen=24)
+    s._model_slot = "current"
+    s._last_funding_settlement = None
+
+    fresh_dual_models = {"up": DummyBooster(0.61), "down": DummyBooster(0.73)}
+    fresh_dual_meta = {
+        "slot": "current",
+        "artifact_version": 2,
+        "bundle_version": 2,
+        "format": "dual_bundle",
+        "threshold": 0.55,
+        "down_threshold": 0.52,
+        "down_enabled": True,
+        "inference_mode": "dual",
+    }
+
+    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime_sync
+    orig_async_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime
+    orig_preloaded = strategy_mod._PRELOADED_MODEL_BUNDLE
+    orig_reload_requested = strategy_mod._RELOAD_REQUESTED
+
+    def fake_runtime_loader(slot):
+        assert slot == "current"
+        return fresh_dual_models, fresh_dual_meta
+
+    async def fail_if_async_loader_used(slot):
+        raise AssertionError("async runtime loader should not be used by MLStrategy._load_model")
+
+    strategy_mod.model_store.load_model_bundle_for_runtime_sync = fake_runtime_loader
+    strategy_mod.model_store.load_model_bundle_for_runtime = fail_if_async_loader_used
+    strategy_mod._PRELOADED_MODEL_BUNDLE = None
+    strategy_mod._RELOAD_REQUESTED = True
+
+    try:
+        async def runner():
+            s._load_model()
+
+        asyncio.run(runner())
+
+        assert s._models is not None
+        assert s._models["up"].predict(None) == [0.61]
+        assert s._models["down"].predict(None) == [0.73]
+        assert s._model_meta["inference_mode"] == "dual"
+        assert s._model_meta["has_real_down_model"] is True
+    finally:
+        strategy_mod.model_store.load_model_bundle_for_runtime_sync = orig_runtime_loader
+        strategy_mod.model_store.load_model_bundle_for_runtime = orig_async_runtime_loader
+        strategy_mod._PRELOADED_MODEL_BUNDLE = orig_preloaded
+        strategy_mod._RELOAD_REQUESTED = orig_reload_requested
