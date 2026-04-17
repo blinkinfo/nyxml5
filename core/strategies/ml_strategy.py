@@ -429,13 +429,18 @@ class MLStrategy(BaseStrategy):
             # complement semantics without pretending that fallback is a real DOWN model.
             prob = float(up_model.predict(feature_row)[0])
             inference_mode = (self._model_meta or {}).get("inference_mode", "legacy_single")
+            down_model_is_same_object_as_up_model = down_model is up_model and down_model is not None
             has_real_down_model = bool((self._model_meta or {}).get("has_real_down_model", False))
             if has_real_down_model and down_model is not None:
                 prob_down = float(down_model.predict(feature_row)[0])
+                p_down_source = "down_booster"
             else:
                 prob_down = round(1.0 - prob, 6)
                 inference_mode = "legacy_single"
                 has_real_down_model = False
+                p_down_source = "complement_fallback"
+            prob_up_complement = round(1.0 - prob, 6)
+            prob_down_minus_complement = round(prob_down - prob_up_complement, 6)
 
             up_threshold, down_threshold = await self._resolve_thresholds()
             up_qualifies = prob >= up_threshold
@@ -506,6 +511,12 @@ class MLStrategy(BaseStrategy):
                                 up_threshold=up_threshold,
                                 down_threshold=down_threshold,
                                 down_enabled=down_enabled,
+                                inference_mode=inference_mode,
+                                has_real_down_model=has_real_down_model,
+                                down_model_is_same_object_as_up_model=down_model_is_same_object_as_up_model,
+                                p_down_source=p_down_source,
+                                p_up_complement=prob_up_complement,
+                                p_down_minus_complement=prob_down_minus_complement,
                                 fired=False,
                                 side=None,
                                 skip_reason=_regime_skip_reason,
@@ -596,10 +607,12 @@ class MLStrategy(BaseStrategy):
                 }
 
             log.info(
-                "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "
-                "down_enabled=%s inference_mode=%s slot=%s",
-                side, prob, prob_down, up_threshold, down_threshold,
-                down_enabled, inference_mode, slug,
+                "MLStrategy: side=%s p_up=%.4f p_down=%.4f raw_1_minus_p_up=%.4f delta_p_down_vs_complement=%+.6f "
+                "up_thr=%.3f down_thr=%.3f down_enabled=%s inference_mode=%s has_real_down_model=%s "
+                "down_model_same_as_up=%s p_down_source=%s slot=%s",
+                side, prob, prob_down, prob_up_complement, prob_down_minus_complement,
+                up_threshold, down_threshold, down_enabled, inference_mode, has_real_down_model,
+                down_model_is_same_object_as_up_model, p_down_source, slug,
             )
 
             # Fetch Polymarket prices — identical to PatternStrategy
@@ -629,6 +642,12 @@ class MLStrategy(BaseStrategy):
                     up_threshold=up_threshold,
                     down_threshold=down_threshold,
                     down_enabled=down_enabled,
+                    inference_mode=inference_mode,
+                    has_real_down_model=has_real_down_model,
+                    down_model_is_same_object_as_up_model=down_model_is_same_object_as_up_model,
+                    p_down_source=p_down_source,
+                    p_up_complement=prob_up_complement,
+                    p_down_minus_complement=prob_down_minus_complement,
                     fired=False,
                     side=side,
                     skip_reason="Market data unavailable (no Polymarket prices)",
@@ -675,6 +694,12 @@ class MLStrategy(BaseStrategy):
                 up_threshold=up_threshold,
                 down_threshold=down_threshold,
                 down_enabled=down_enabled,
+                inference_mode=inference_mode,
+                has_real_down_model=has_real_down_model,
+                down_model_is_same_object_as_up_model=down_model_is_same_object_as_up_model,
+                p_down_source=p_down_source,
+                p_up_complement=prob_up_complement,
+                p_down_minus_complement=prob_down_minus_complement,
                 fired=True,
                 side=side,
                 skip_reason=None,

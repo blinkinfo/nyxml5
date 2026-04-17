@@ -132,6 +132,12 @@ def log_inference(
     up_threshold: float | None,
     down_threshold: float | None,
     down_enabled: bool,
+    inference_mode: str = "legacy_single",
+    has_real_down_model: bool = False,
+    down_model_is_same_object_as_up_model: bool = False,
+    p_down_source: str = "unknown",
+    p_up_complement: float | None = None,
+    p_down_minus_complement: float | None = None,
     # --- Decision ---
     fired: bool,
     side: str | None,       # "Up" / "Down" / None
@@ -180,11 +186,17 @@ def log_inference(
 
             # Model output
             "model": {
-                "p_up":           _safe_float(p_up),
-                "p_down":         _safe_float(p_down),
-                "up_threshold":   _safe_float(up_threshold),
+                "inference_mode": inference_mode,
+                "has_real_down_model": has_real_down_model,
+                "down_model_is_same_object_as_up_model": down_model_is_same_object_as_up_model,
+                "p_down_source": p_down_source,
+                "p_up": _safe_float(p_up),
+                "p_down": _safe_float(p_down),
+                "p_up_complement": _safe_float(p_up_complement),
+                "p_down_minus_complement": _safe_float(p_down_minus_complement),
+                "up_threshold": _safe_float(up_threshold),
                 "down_threshold": _safe_float(down_threshold),
-                "down_enabled":   down_enabled,
+                "down_enabled": down_enabled,
             },
 
             # Trade decision
@@ -366,6 +378,12 @@ def log_skipped_data(
         up_threshold=None,
         down_threshold=None,
         down_enabled=False,
+        inference_mode="legacy_single",
+        has_real_down_model=False,
+        down_model_is_same_object_as_up_model=False,
+        p_down_source="not_available",
+        p_up_complement=None,
+        p_down_minus_complement=None,
         fired=False,
         side=None,
         skip_reason=skip_reason,

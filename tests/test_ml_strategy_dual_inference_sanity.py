@@ -123,3 +123,39 @@ def test_dual_mode_is_presented_in_status():
         0.56,
     )
     assert "Dual booster" in text
+
+
+def test_dual_diagnostics_log_line_is_unambiguous(caplog):
+    caplog.set_level(logging.INFO)
+    side = "Down"
+    prob = 0.61
+    prob_down = 0.73
+    prob_up_complement = round(1.0 - prob, 6)
+    prob_down_minus_complement = round(prob_down - prob_up_complement, 6)
+    up_threshold = 0.55
+    down_threshold = 0.52
+    down_enabled = True
+    inference_mode = "dual"
+    has_real_down_model = True
+    down_model_is_same_object_as_up_model = False
+    p_down_source = "down_booster"
+    slug = "slot-123"
+
+    logging.getLogger("core.strategies.ml_strategy").info(
+        "MLStrategy: side=%s p_up=%.4f p_down=%.4f raw_1_minus_p_up=%.4f delta_p_down_vs_complement=%+.6f "
+        "up_thr=%.3f down_thr=%.3f down_enabled=%s inference_mode=%s has_real_down_model=%s "
+        "down_model_same_as_up=%s p_down_source=%s slot=%s",
+        side, prob, prob_down, prob_up_complement, prob_down_minus_complement,
+        up_threshold, down_threshold, down_enabled, inference_mode, has_real_down_model,
+        down_model_is_same_object_as_up_model, p_down_source, slug,
+    )
+
+    msg = caplog.text
+    assert "inference_mode=dual" in msg
+    assert "has_real_down_model=True" in msg
+    assert "down_model_same_as_up=False" in msg
+    assert "p_down_source=down_booster" in msg
+    assert "p_up=0.6100" in msg
+    assert "p_down=0.7300" in msg
+    assert "raw_1_minus_p_up=0.3900" in msg
+    assert "delta_p_down_vs_complement=+0.340000" in msg
