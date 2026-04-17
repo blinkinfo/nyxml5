@@ -229,6 +229,100 @@ def test_retrain_blocked_report_separates_gate_from_down_enablement():
     assert "walk-forward median" in text
 
 
+def test_reload_prefers_canonical_current_bundle_over_stale_disk_legacy_artifact():
+    import core.strategies.ml_strategy as strategy_mod
+
+    s = MLStrategy.__new__(MLStrategy)
+    s._models = None
+    s._model_meta = {}
+    s._funding_buffer = deque(maxlen=24)
+    s._model_slot = "current"
+    s._last_funding_settlement = None
+
+    fresh_dual_models = {"up": DummyBooster(0.61), "down": DummyBooster(0.73)}
+    fresh_dual_meta = {
+        "slot": "current",
+        "artifact_version": 2,
+        "bundle_version": 2,
+        "format": "dual_bundle",
+        "threshold": 0.55,
+        "down_threshold": 0.52,
+        "down_enabled": True,
+    }
+
+    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime
+    orig_preloaded = strategy_mod._PRELOADED_MODEL_BUNDLE
+    orig_reload_requested = strategy_mod._RELOAD_REQUESTED
+
+    async def fake_runtime_loader(slot):
+        assert slot == "current"
+        return fresh_dual_models, fresh_dual_meta
+
+    strategy_mod.model_store.load_model_bundle_for_runtime = fake_runtime_loader
+    strategy_mod._PRELOADED_MODEL_BUNDLE = {
+        "models": {"up": DummyBooster(0.58), "down": DummyBooster(0.41)},
+        "metadata": fresh_dual_meta,
+    }
+    strategy_mod._RELOAD_REQUESTED = True
+
+    try:
+        s._load_model()
+        assert s._model_meta["inference_mode"] == "dual"
+        assert s._model_meta["has_real_down_model"] is True
+        assert s._models is not None and s._models["down"].predict(None) == [0.41]
+
+        strategy_mod._RELOAD_REQUESTED = True
+        s._load_model()
+
+        assert s._model_meta["inference_mode"] == "dual"
+        assert s._model_meta["has_real_down_model"] is True
+        assert s._models is not None and s._models["up"].predict(None) == [0.61]
+        assert s._models["down"].predict(None) == [0.73]
+    finally:
+        strategy_mod.model_store.load_model_bundle_for_runtime = orig_runtime_loader
+        strategy_mod._PRELOADED_MODEL_BUNDLE = orig_preloaded
+        strategy_mod._RELOAD_REQUESTED = orig_reload_requested
+
+
+def test_runtime_current_bundle_loader_prefers_db_but_falls_back_to_disk():
+    import ml.model_store as store
+
+    db_models = {"up": DummyBooster(0.61), "down": DummyBooster(0.73)}
+    db_meta = {"slot": "current", "artifact_version": 2, "down_enabled": True}
+    disk_models = {"up": DummyBooster(0.52), "down": DummyBooster(0.52)}
+    disk_meta = {"slot": "current", "threshold": 0.55}
+
+    orig_db_loader = store.load_model_bundle_from_db
+    orig_disk_loader = store.load_model_bundle
+
+    async def fake_db_loader(slot):
+        assert slot == "current"
+        return db_models, db_meta
+
+    def fake_disk_loader(slot):
+        assert slot == "current"
+        return disk_models, disk_meta
+
+    store.load_model_bundle_from_db = fake_db_loader
+    store.load_model_bundle = fake_disk_loader
+    try:
+        models, meta = asyncio.run(store.load_model_bundle_for_runtime("current"))
+        assert models is db_models
+        assert meta is db_meta
+
+        async def fake_missing_db_loader(slot):
+            assert slot == "current"
+            return None, None
+
+        store.load_model_bundle_from_db = fake_missing_db_loader
+        models, meta = asyncio.run(store.load_model_bundle_for_runtime("current"))
+        assert models is disk_models
+        assert meta is disk_meta
+    finally:
+        store.load_model_bundle_from_db = orig_db_loader
+        store.load_model_bundle = orig_disk_loader
+
+
 def test_dual_diagnostics_log_line_is_unambiguous(caplog):
     caplog.set_level(logging.INFO)
     side = "Down"
@@ -263,3 +357,141 @@ def test_dual_diagnostics_log_line_is_unambiguous(caplog):
     assert "p_down=0.7300" in msg
     assert "raw_1_minus_p_up=0.3900" in msg
     assert "delta_p_down_vs_complement=+0.340000" in msg
+
+
+def test_runtime_bundle_diagnostics_reports_dual_bundle_cleanly():
+    import core.strategies.ml_strategy as strategy_mod
+
+    diag = strategy_mod._runtime_bundle_diagnostics(
+        {"up": DummyBooster(0.61), "down": DummyBooster(0.73)},
+        {
+            "slot": "current",
+            "format": "dual_bundle",
+            "artifact_version": 2,
+            "inference_mode": "dual",
+            "down_enabled": True,
+            "threshold": 0.55,
+            "down_threshold": 0.52,
+        },
+        load_source="runtime_loader",
+        reload_requested=True,
+    )
+
+    assert diag["load_source"] == "runtime_loader"
+    assert diag["reload_requested"] is True
+    assert diag["artifact_format"] == "dual_bundle"
+    assert diag["artifact_version"] == 2
+    assert diag["runtime_inference_mode"] == "dual"
+    assert diag["models_are_distinct"] is True
+    assert diag["runtime_down_source"] == "down_model"
+    assert diag["inconsistencies"] == []
+
+
+def test_runtime_bundle_diagnostics_flags_legacy_fallback_from_dual_metadata():
+    import core.strategies.ml_strategy as strategy_mod
+
+    shared = DummyBooster(0.61)
+    diag = strategy_mod._runtime_bundle_diagnostics(
+        {"up": shared, "down": shared},
+        {
+            "slot": "current",
+            "format": "dual_bundle",
+            "artifact_version": 2,
+            "inference_mode": "dual",
+            "down_enabled": True,
+            "threshold": 0.55,
+            "down_threshold": 0.52,
+        },
+        load_source="preloaded",
+        reload_requested=False,
+    )
+
+    assert diag["artifact_format"] == "dual_bundle"
+    assert diag["runtime_inference_mode"] == "legacy_single"
+    assert diag["models_are_distinct"] is False
+    assert diag["runtime_down_source"] == "complement_fallback"
+    assert "metadata_dual_runtime_complement_fallback" in diag["inconsistencies"]
+    assert "runtime_down_model_aliases_up_model" in diag["inconsistencies"]
+    assert "down_enabled_without_distinct_down_model" in diag["inconsistencies"]
+
+
+def test_runtime_bundle_diagnostics_flags_dual_metadata_missing_runtime_down_model():
+    import core.strategies.ml_strategy as strategy_mod
+
+    diag = strategy_mod._runtime_bundle_diagnostics(
+        {"up": DummyBooster(0.61)},
+        {
+            "slot": "current",
+            "format": "dual_bundle",
+            "artifact_version": 2,
+            "inference_mode": "dual",
+            "down_enabled": False,
+            "threshold": 0.55,
+            "down_threshold": 0.52,
+        },
+        load_source="runtime_loader",
+        reload_requested=False,
+    )
+
+    assert diag["has_down_model"] is False
+    assert diag["runtime_inference_mode"] == "legacy_single"
+    assert "metadata_dual_runtime_complement_fallback" in diag["inconsistencies"]
+    assert "dual_bundle_metadata_missing_runtime_down_model" in diag["inconsistencies"]
+
+
+def test_load_model_logs_structured_runtime_diagnostics_for_preloaded_and_reload(caplog):
+    import core.strategies.ml_strategy as strategy_mod
+
+    caplog.set_level(logging.INFO)
+    s = MLStrategy.__new__(MLStrategy)
+    s._models = None
+    s._model_meta = {}
+    s._funding_buffer = deque(maxlen=24)
+    s._model_slot = "current"
+    s._last_funding_settlement = None
+
+    fresh_dual_models = {"up": DummyBooster(0.61), "down": DummyBooster(0.73)}
+    fresh_dual_meta = {
+        "slot": "current",
+        "artifact_version": 2,
+        "bundle_version": 2,
+        "format": "dual_bundle",
+        "threshold": 0.55,
+        "down_threshold": 0.52,
+        "down_enabled": True,
+        "inference_mode": "dual",
+    }
+
+    orig_runtime_loader = strategy_mod.model_store.load_model_bundle_for_runtime
+    orig_preloaded = strategy_mod._PRELOADED_MODEL_BUNDLE
+    orig_reload_requested = strategy_mod._RELOAD_REQUESTED
+
+    async def fake_runtime_loader(slot):
+        assert slot == "current"
+        return fresh_dual_models, fresh_dual_meta
+
+    strategy_mod.model_store.load_model_bundle_for_runtime = fake_runtime_loader
+    strategy_mod._PRELOADED_MODEL_BUNDLE = {
+        "models": {"up": DummyBooster(0.58), "down": DummyBooster(0.41)},
+        "metadata": fresh_dual_meta,
+    }
+    strategy_mod._RELOAD_REQUESTED = True
+
+    try:
+        s._load_model()
+        strategy_mod._RELOAD_REQUESTED = True
+        s._load_model()
+    finally:
+        strategy_mod.model_store.load_model_bundle_for_runtime = orig_runtime_loader
+        strategy_mod._PRELOADED_MODEL_BUNDLE = orig_preloaded
+        strategy_mod._RELOAD_REQUESTED = orig_reload_requested
+
+    msg = caplog.text
+    assert "source=preloaded" in msg
+    assert "source=runtime_loader" in msg
+    assert "artifact_format=dual_bundle" in msg
+    assert "artifact_version=2" in msg
+    assert "runtime_inference_mode=dual" in msg
+    assert "models_are_distinct=True" in msg
+    assert "runtime_down_source=down_model" in msg
+    assert "inconsistencies=[]" in msg

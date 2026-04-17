@@ -84,6 +84,100 @@ def set_model(model) -> None:
     set_model_bundle({"up": model}, {})
 
 
+def _runtime_bundle_diagnostics(
+    models: dict[str, Any] | None,
+    metadata: dict | None,
+    *,
+    load_source: str,
+    reload_requested: bool,
+) -> dict[str, Any]:
+    """Summarize runtime bundle state for focused load/reload diagnostics."""
+    meta = dict(metadata or {})
+    model_keys = sorted(models.keys()) if models else []
+    up_model = models.get("up") if models else None
+    down_model = models.get("down") if models else None
+    has_any_models = bool(models)
+    has_up_model = up_model is not None
+    has_down_key = down_model is not None
+    models_are_distinct = has_down_key and down_model is not up_model
+    runtime_inference_mode = "dual" if models_are_distinct else "legacy_single"
+    runtime_down_source = "down_model" if models_are_distinct else "complement_fallback"
+    meta_inference_mode = meta.get("inference_mode")
+    artifact_format = meta.get("format") or ("dual_bundle" if int(meta.get("artifact_version") or meta.get("bundle_version") or 1) >= 2 else "legacy_single")
+    artifact_version = int(meta.get("artifact_version") or meta.get("bundle_version") or 1)
+    down_enabled = bool(meta.get("down_enabled", False))
+    inconsistencies: list[str] = []
+
+    if meta_inference_mode == "dual" and not models_are_distinct:
+        inconsistencies.append("metadata_dual_runtime_complement_fallback")
+    if artifact_format == "dual_bundle" and not has_down_key:
+        inconsistencies.append("dual_bundle_metadata_missing_runtime_down_model")
+    if has_down_key and not models_are_distinct:
+        inconsistencies.append("runtime_down_model_aliases_up_model")
+    if has_down_key and artifact_format != "dual_bundle":
+        inconsistencies.append("runtime_has_down_model_but_metadata_not_dual_bundle")
+    if down_enabled and not models_are_distinct:
+        inconsistencies.append("down_enabled_without_distinct_down_model")
+
+    return {
+        "load_source": load_source,
+        "reload_requested": reload_requested,
+        "slot": meta.get("slot", "current"),
+        "artifact_format": artifact_format,
+        "artifact_version": artifact_version,
+        "meta_inference_mode": meta_inference_mode,
+        "runtime_inference_mode": runtime_inference_mode,
+        "down_enabled": down_enabled,
+        "threshold": meta.get("threshold"),
+        "down_threshold": meta.get("down_threshold"),
+        "model_keys": model_keys,
+        "has_any_models": has_any_models,
+        "has_up_model": has_up_model,
+        "has_down_model": has_down_key,
+        "models_are_distinct": models_are_distinct,
+        "runtime_down_source": runtime_down_source,
+        "inconsistencies": inconsistencies,
+    }
+
+
+def _log_runtime_bundle_diagnostics(
+    models: dict[str, Any] | None,
+    metadata: dict | None,
+    *,
+    load_source: str,
+    reload_requested: bool,
+) -> None:
+    diag = _runtime_bundle_diagnostics(
+        models,
+        metadata,
+        load_source=load_source,
+        reload_requested=reload_requested,
+    )
+    log.info(
+        "MLStrategy: runtime model load source=%s reload_requested=%s slot=%s artifact_format=%s artifact_version=%s "
+        "meta_inference_mode=%s runtime_inference_mode=%s down_enabled=%s threshold=%s down_threshold=%s "
+        "model_keys=%s has_any_models=%s has_up_model=%s has_down_model=%s models_are_distinct=%s "
+        "runtime_down_source=%s inconsistencies=%s",
+        diag["load_source"],
+        diag["reload_requested"],
+        diag["slot"],
+        diag["artifact_format"],
+        diag["artifact_version"],
+        diag["meta_inference_mode"],
+        diag["runtime_inference_mode"],
+        diag["down_enabled"],
+        diag["threshold"],
+        diag["down_threshold"],
+        diag["model_keys"],
+        diag["has_any_models"],
+        diag["has_up_model"],
+        diag["has_down_model"],
+        diag["models_are_distinct"],
+        diag["runtime_down_source"],
+        diag["inconsistencies"],
+    )
+
+
 def request_model_reload() -> None:
     """Signal that the model should be reloaded on the next check_signal call."""
     global _RELOAD_REQUESTED
@@ -158,8 +252,9 @@ class MLStrategy(BaseStrategy):
         return now.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
 
     def _load_model(self) -> None:
-        """Load the current model — use preloaded model if available, else load from disk."""
+        """Load the current model, preferring the canonical runtime source for current."""
         global _RELOAD_REQUESTED, _PRELOADED_MODEL_BUNDLE
+        reload_requested = _RELOAD_REQUESTED
         if _PRELOADED_MODEL_BUNDLE is not None:
             self._models, preloaded_meta = _normalize_runtime_bundle(
                 _PRELOADED_MODEL_BUNDLE.get("models"),
@@ -169,10 +264,15 @@ class MLStrategy(BaseStrategy):
             self._model_slot = preloaded_meta.get("slot", "current")
             _PRELOADED_MODEL_BUNDLE = None
             _RELOAD_REQUESTED = False
-            log.info("MLStrategy: model bundle set from preloaded instance")
+            _log_runtime_bundle_diagnostics(
+                self._models,
+                self._model_meta,
+                load_source="preloaded",
+                reload_requested=reload_requested,
+            )
             return
 
-        models, meta = model_store.load_model_bundle("current")
+        models, meta = asyncio.run(model_store.load_model_bundle_for_runtime("current"))
         self._models, normalized_meta = _normalize_runtime_bundle(models, meta)
         self._model_meta = normalized_meta
         self._model_slot = normalized_meta.get("slot", "current")
@@ -180,7 +280,12 @@ class MLStrategy(BaseStrategy):
         if self._models is None:
             log.warning("MLStrategy: no trained model bundle found in current slot")
         else:
-            log.info("MLStrategy: model bundle loaded successfully")
+            _log_runtime_bundle_diagnostics(
+                self._models,
+                self._model_meta,
+                load_source="runtime_loader",
+                reload_requested=reload_requested,
+            )
 
     async def _get_threshold(self) -> float:
         """Read UP threshold from ml_config table, fall back to cfg default."""

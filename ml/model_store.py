@@ -214,6 +214,42 @@ def save_model_bundle(models: dict[str, lgb.Booster], slot: str, metadata: dict)
     log.info("save_model_bundle: saved slot=%s keys=%s", slot, sorted(models.keys()))
 
 
+async def load_model_bundle_for_runtime(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
+    """Load the runtime bundle from the canonical source for the slot.
+
+    The current slot is promoted into the DB and preloaded into strategy memory, so
+    runtime reloads should prefer the DB-backed copy to avoid bouncing between a
+    fresher DB artifact and a stale on-disk artifact. Other slots keep the existing
+    disk-first behavior, and current still falls back to disk for backward
+    compatibility when no DB row exists.
+    """
+    if slot == "current":
+        db_models, db_meta = await load_model_bundle_from_db(slot)
+        if db_models and db_meta:
+            log.info(
+                "load_model_bundle_for_runtime: slot=%s source=db artifact_format=%s artifact_version=%s down_enabled=%s model_keys=%s",
+                slot,
+                db_meta.get("format"),
+                db_meta.get("artifact_version") or db_meta.get("bundle_version"),
+                db_meta.get("down_enabled"),
+                sorted(db_models.keys()),
+            )
+            return db_models, db_meta
+        log.info("load_model_bundle_for_runtime: slot=%s source=db_miss -> fallback=disk", slot)
+
+    models, meta = load_model_bundle(slot)
+    if models and meta:
+        log.info(
+            "load_model_bundle_for_runtime: slot=%s source=disk artifact_format=%s artifact_version=%s down_enabled=%s model_keys=%s",
+            slot,
+            meta.get("format"),
+            meta.get("artifact_version") or meta.get("bundle_version"),
+            meta.get("down_enabled"),
+            sorted(models.keys()),
+        )
+    return models, meta
+
+
 def load_model_bundle(slot: str = "current") -> tuple[dict[str, lgb.Booster], dict] | tuple[None, None]:
     """Load bundle models and metadata, falling back to legacy single-model artifacts."""
     bundle_models = _load_bundle_models_from_disk(slot)
