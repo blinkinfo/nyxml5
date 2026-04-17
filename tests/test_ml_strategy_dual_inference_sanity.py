@@ -1,8 +1,9 @@
 import asyncio
+import logging
 from collections import deque
 
 from core.strategies.ml_strategy import MLStrategy, _normalize_runtime_bundle
-from bot.formatters import format_model_status
+from bot.formatters import format_model_status, format_retrain_blocked, format_retrain_complete
 
 
 class DummyBooster:
@@ -123,6 +124,109 @@ def test_dual_mode_is_presented_in_status():
         0.56,
     )
     assert "Dual booster" in text
+
+
+def test_retrain_complete_report_is_dual_bundle_aware():
+    text, risk = format_retrain_complete(
+        {
+            "train_date": "2026-04-17T10:00:00Z",
+            "sample_count": 1234,
+            "data_start": "2026-01-01",
+            "data_end": "2026-04-16",
+            "payout": 0.85,
+            "format": "dual_bundle",
+            "bundle_version": 2,
+            "artifact_version": 2,
+            "inference_mode": "dual",
+            "threshold": 0.55,
+            "threshold_source": "walk_forward_validation_median",
+            "val_wr": 0.59,
+            "test_wr": 0.61,
+            "test_trades_per_day": 4.2,
+            "up_ev_per_day": 0.23,
+            "down_threshold": 0.52,
+            "down_val_wr": 0.58,
+            "down_test_wr": 0.57,
+            "down_test_tpd": 3.4,
+            "down_ev_per_day": 0.11,
+            "down_enabled": True,
+            "models": {
+                "up": {
+                    "threshold": 0.55,
+                    "val_wr": 0.59,
+                    "test_wr": 0.61,
+                    "test_trades_per_day": 4.2,
+                    "ev_per_day": 0.23,
+                },
+                "down": {
+                    "threshold": 0.52,
+                    "val_wr": 0.58,
+                    "test_wr": 0.57,
+                    "test_trades_per_day": 3.4,
+                    "ev_per_day": 0.11,
+                    "enabled": True,
+                },
+            },
+        },
+        0.56,
+    )
+    assert risk is None
+    assert "Dual-bundle artifact (candidate/current-ready)" in text
+    assert "Deployment gate passed" in text
+    assert "Enabled for live DOWN signals" in text
+    assert "walk-forward median" in text
+    assert "eligible to become current after review" in text
+
+
+def test_retrain_blocked_report_separates_gate_from_down_enablement():
+    text, _ = format_retrain_blocked(
+        {
+            "train_date": "2026-04-17T10:00:00Z",
+            "sample_count": 1234,
+            "payout": 0.85,
+            "format": "dual_bundle",
+            "bundle_version": 2,
+            "artifact_version": 2,
+            "inference_mode": "dual",
+            "threshold": 0.55,
+            "threshold_source": "walk_forward_validation_median",
+            "val_wr": 0.59,
+            "test_wr": 0.56,
+            "test_trades_per_day": 4.2,
+            "up_ev_per_day": 0.05,
+            "down_threshold": 0.52,
+            "down_val_wr": 0.58,
+            "down_test_wr": 0.57,
+            "down_test_tpd": 3.4,
+            "down_ev_per_day": 0.11,
+            "down_enabled": False,
+            "models": {
+                "up": {
+                    "threshold": 0.55,
+                    "val_wr": 0.59,
+                    "test_wr": 0.56,
+                    "test_trades_per_day": 4.2,
+                    "ev_per_day": 0.05,
+                    "blocked": True,
+                },
+                "down": {
+                    "threshold": 0.52,
+                    "val_wr": 0.58,
+                    "test_wr": 0.57,
+                    "test_trades_per_day": 3.4,
+                    "ev_per_day": 0.11,
+                    "enabled": False,
+                    "blocked": True,
+                },
+            },
+        },
+        0.56,
+    )
+    assert "candidate, not live" in text
+    assert "Deployment gate failed" in text
+    assert "Disabled for live DOWN signals" in text
+    assert "current-ready artifact not auto-promoted" in text
+    assert "walk-forward median" in text
 
 
 def test_dual_diagnostics_log_line_is_unambiguous(caplog):

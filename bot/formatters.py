@@ -40,6 +40,106 @@ def _resolve_inference_mode(meta: dict) -> tuple[str, str]:
     return "legacy_single", "Legacy single-model fallback"
 
 
+def _resolve_side_metric(meta: dict, side: str, key: str, fallback: object = None) -> object:
+    """Resolve a side metric from nested bundle metadata first, then legacy top-level keys."""
+    side_meta = meta.get("models", {}).get(side, {})
+    if key in side_meta and side_meta.get(key) is not None:
+        return side_meta.get(key)
+
+    legacy_keys = {
+        "up": {
+            "threshold": "threshold",
+            "val_wr": "val_wr",
+            "val_trades_per_day": "val_trades_per_day",
+            "test_wr": "test_wr",
+            "test_trades_per_day": "test_trades_per_day",
+            "ev_per_day": "up_ev_per_day",
+            "enabled": None,
+            "blocked": "blocked",
+        },
+        "down": {
+            "threshold": "down_threshold",
+            "val_wr": "down_val_wr",
+            "val_trades_per_day": "down_val_tpd",
+            "test_wr": "down_test_wr",
+            "test_trades_per_day": "down_test_tpd",
+            "ev_per_day": "down_ev_per_day",
+            "enabled": "down_enabled",
+            "blocked": None,
+        },
+    }
+    legacy_key = legacy_keys.get(side, {}).get(key)
+    if legacy_key and meta.get(legacy_key) is not None:
+        return meta.get(legacy_key)
+    return fallback
+
+
+def _resolve_threshold_source(meta: dict, side: str) -> str:
+    """Return a human-readable threshold source using only present metadata."""
+    side_meta = meta.get("models", {}).get(side, {})
+    source = side_meta.get("threshold_source")
+    if source is None and side == "up":
+        source = meta.get("threshold_source")
+    if source == "walk_forward_validation_median":
+        return "walk-forward median"
+    return "metadata"
+
+
+def _resolve_bundle_label(meta: dict) -> str:
+    """Return artifact label for retrain reports."""
+    if meta.get("format") == "dual_bundle" or meta.get("bundle_version") == 2 or meta.get("artifact_version") == 2:
+        return "Dual-bundle artifact"
+    return "Model artifact"
+
+
+def _format_ev(value: object) -> str:
+    if value in (None, 0, 0.0):
+        return "N/A"
+    return f"{float(value):+.2f}"
+
+
+def _build_side_report_section(
+    meta: dict,
+    side: str,
+    threshold: float,
+    gate: float | None = None,
+) -> str:
+    """Build one side section for retrain reports using dual-bundle-aware labels."""
+    label = "UP model" if side == "up" else "DOWN model"
+    arrow = "\u2191" if side == "up" else "\u2193"
+    val_wr = float(_resolve_side_metric(meta, side, "val_wr", 0.0) or 0.0)
+    test_wr = _resolve_side_metric(meta, side, "test_wr")
+    tpd = float(_resolve_side_metric(meta, side, "test_trades_per_day", _resolve_side_metric(meta, side, "val_trades_per_day", 0.0)) or 0.0)
+    ev_day = _format_ev(_resolve_side_metric(meta, side, "ev_per_day"))
+    threshold_source = _resolve_threshold_source(meta, side)
+
+    lines = [f"\u2502 {arrow} {label}\n"]
+    if test_wr is None:
+        lines.append(f"\u2502   Status     \u26d4 Not validated\n")
+        lines.append(f"\u2502   Threshold  \u2265 {threshold*100:.1f}%  ({threshold_source})\n")
+        return "".join(lines)
+
+    test_wr = float(test_wr)
+    if side == "up":
+        gate_margin = round((test_wr - float(gate or 0.0)) * 100, 1)
+        gate_margin_str = f"{gate_margin:+.1f}%"
+        gate_pass = test_wr >= float(gate or 0.0)
+        gate_icon = "\u2705" if gate_pass else "\u274c"
+        gate_text = "passed" if gate_pass else "failed"
+        lines.append(f"\u2502   Gate       {gate_icon} Deployment gate {gate_text} ({gate_margin_str})\n")
+    else:
+        enabled = bool(_resolve_side_metric(meta, side, "enabled", False))
+        status_icon = "\u2705" if enabled else "\u26d4"
+        status_text = "Enabled for live DOWN signals" if enabled else "Disabled for live DOWN signals"
+        lines.append(f"\u2502   Status     {status_icon} {status_text}\n")
+
+    lines.append(f"\u2502   Win Rate   val {val_wr*100:.1f}% / test {test_wr*100:.1f}%\n")
+    lines.append(f"\u2502   Threshold  \u2265 {threshold*100:.1f}%  ({threshold_source})\n")
+    lines.append(f"\u2502   Trades/day {tpd:.1f}\n")
+    lines.append(f"\u2502   EV/day     {ev_day}\n")
+    return "".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Risk card helper — shared by both retrain formatters.
 #
@@ -972,141 +1072,73 @@ def format_retrain_blocked(meta: dict, threshold: float) -> tuple[str, str | Non
     Both messages must be sent with parse_mode='HTML'.
     """
     _GATE = 0.58
-    threshold, down_thr = _resolve_model_thresholds(meta, threshold)
-    down_enabled = bool(meta.get("down_enabled", False))
+    up_threshold, down_threshold = _resolve_model_thresholds(meta, threshold)
     _, inference_label = _resolve_inference_mode(meta)
-    down_val_wr  = meta.get("down_val_wr")
-    down_test_wr = meta.get("down_test_wr")
-    down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
+    bundle_label = _resolve_bundle_label(meta)
 
-    up_test_wr    = meta.get("test_wr", 0)
-    shortfall     = round((up_test_wr - _GATE) * 100, 1)   # always negative here
-    shortfall_str = f"{shortfall:+.1f}%"                   # e.g. "-2.2%"
-
-    # Data date range (ISO date strings, e.g. "2025-11-14")
     data_start = meta.get("data_start")
-    data_end   = meta.get("data_end")
+    data_end = meta.get("data_end")
     if data_start and data_end:
-        data_line = f"\u2502 \U0001f5d3 Data:     {_e(data_start)} \u2192 {_e(data_end)}\n"
+        data_line = f"│ 🗓 Data:     {_e(data_start)} → {_e(data_end)}\n"
     else:
         data_line = ""
 
-    # Payout ratio
-    payout     = meta.get("payout", 0.85)
-    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
-
-    # UP EV/day
-    up_ev      = meta.get("up_ev_per_day", 0.0)
-    up_ev_str  = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
-
-    # DOWN section
-    if _has_validated_down_side(meta):
-        down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
-        down_status_icon = "\u2705" if down_enabled else "\u26d4"
-        down_ev     = meta.get("down_ev_per_day", 0.0)
-        down_ev_str = f"{down_ev:+.2f}" if down_ev != 0.0 else "N/A"
-        down_section = (
-            f"\u2502 \u2193 DOWN Side              {down_status_icon} {down_status_lbl}\n"
-            f"\u2502   Val  {down_val_wr*100:.1f}%  /  Test  {down_test_wr*100:.1f}%\n"
-            f"\u2502   Threshold \u2265 {down_thr*100:.1f}%  \u2022  {down_tpd:.1f} trades/day\n"
-            f"\u2502   EV/day  {down_ev_str}\n"
-        )
-    else:
-        down_section = (
-            "\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
-            "\u2502   Not validated\n"
-        )
+    payout = meta.get("payout", 0.85)
+    payout_line = f"│ 💰 Payout:   {payout:.2f}  ({payout*100:.0f}¢ per $1)\n"
 
     main_msg = (
-        "\u26a0\ufe0f <b>Retrain \u2014 Gate NOT Passed</b>\n"
-        "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \U0001f4c5 Trained:  {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
-        f"\u2502 \U0001f4ca Samples:  {meta.get('sample_count', 0):,}\n"
+        "⚠️ <b>Retrain Complete - Candidate blocked for auto-deploy</b>\n"
+        "┌─────────────────────────\n"
+        f"│ 📦 Artifact:  {bundle_label} (candidate, not live)\n"
+        f"│ 🧠 Inference: {inference_label}\n"
+        f"│ 📅 Trained:   {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
+        f"│ 📊 Samples:   {meta.get('sample_count', 0):,}\n"
         f"{data_line}"
         f"{payout_line}"
-        "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \u2191 UP Side        \u274c FAILED  {shortfall_str} below gate\n"
-        f"\u2502   Val  {meta.get('val_wr', 0)*100:.1f}%  /  Test  {up_test_wr*100:.1f}%  (need \u2265 {_GATE*100:.1f}%)\n"
-        f"\u2502   Threshold \u2265 {threshold*100:.1f}%  \u2022  {meta.get('test_trades_per_day', 0):.1f} trades/day\n"
-        f"\u2502   EV/day  {up_ev_str}\n"
-        "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"{down_section}"
-        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        "Candidate saved \u2014 not live.\n"
-        "/model to compare  \u2022  /promote_model to override gate"
+        "├─────────────────────────\n"
+        f"{_build_side_report_section(meta, 'up', up_threshold, gate=_GATE)}"
+        "├─────────────────────────\n"
+        f"{_build_side_report_section(meta, 'down', down_threshold)}"
+        "└─────────────────────────\n"
+        "Candidate saved - current-ready artifact not auto-promoted.\n"
+        "Use /model to compare  •  /promote_model to override gate"
     )
 
     return main_msg, _build_risk_table(meta)
 
 
 def format_retrain_complete(meta: dict, threshold: float) -> tuple[str, str | None]:
-    """Show retrain results for candidate model — UP passed gate, DOWN shown separately.
-
-    Returns a tuple of (main_message, risk_message).
-    *risk_message* is None when no risk data is available.
-    Both messages must be sent with parse_mode='HTML'.
-    """
+    """Show retrain results for a dual-bundle candidate artifact ready for review."""
     _GATE = 0.58
-    threshold, down_thr = _resolve_model_thresholds(meta, threshold)
-    down_enabled = bool(meta.get("down_enabled", False))
+    up_threshold, down_threshold = _resolve_model_thresholds(meta, threshold)
     _, inference_label = _resolve_inference_mode(meta)
-    down_val_wr  = meta.get("down_val_wr")
-    down_test_wr = meta.get("down_test_wr")
-    down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
+    bundle_label = _resolve_bundle_label(meta)
 
-    up_test_wr    = meta.get("test_wr", 0)
-    up_margin     = round((up_test_wr - _GATE) * 100, 1)
-    up_margin_str = f"+{up_margin:.1f}%" if up_margin >= 0 else f"{up_margin:.1f}%"
-
-    # Data date range (ISO date strings, e.g. "2025-11-14")
     data_start = meta.get("data_start")
-    data_end   = meta.get("data_end")
+    data_end = meta.get("data_end")
     if data_start and data_end:
         data_line = f"\u2502 \U0001f5d3 Data:     {_e(data_start)} \u2192 {_e(data_end)}\n"
     else:
         data_line = ""
 
-    # Payout ratio
-    payout      = meta.get("payout", 0.85)
+    payout = meta.get("payout", 0.85)
     payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
 
-    # UP EV/day
-    up_ev     = meta.get("up_ev_per_day", 0.0)
-    up_ev_str = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
-
-    # DOWN section
-    if _has_validated_down_side(meta):
-        down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
-        down_status_icon = "\u2705" if down_enabled else "\u26d4"
-        down_ev     = meta.get("down_ev_per_day", 0.0)
-        down_ev_str = f"{down_ev:+.2f}" if down_ev != 0.0 else "N/A"
-        down_section = (
-            f"\u2502 \u2193 DOWN Side              {down_status_icon} {down_status_lbl}\n"
-            f"\u2502   Val  {down_val_wr*100:.1f}%  /  Test  {down_test_wr*100:.1f}%\n"
-            f"\u2502   Threshold \u2265 {down_thr*100:.1f}%  \u2022  {down_tpd:.1f} trades/day\n"
-            f"\u2502   EV/day  {down_ev_str}\n"
-        )
-    else:
-        down_section = (
-            "\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
-            "\u2502   Not validated\n"
-        )
-
     main_msg = (
-        "\u2705 <b>Retrain Complete</b>\n"
+        "\u2705 <b>Retrain Complete - Candidate ready for promotion review</b>\n"
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \U0001f4c5 Trained:  {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
-        f"\u2502 \U0001f4ca Samples:  {meta.get('sample_count', 0):,}\n"
+        f"\u2502 \U0001f4e6 Artifact:  {bundle_label} (candidate/current-ready)\n"
+        f"\u2502 \U0001f9e0 Inference: {inference_label}\n"
+        f"\u2502 \U0001f4c5 Trained:   {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
+        f"\u2502 \U0001f4ca Samples:   {meta.get('sample_count', 0):,}\n"
         f"{data_line}"
         f"{payout_line}"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \u2191 UP Side        \u2705 Gate passed  {up_margin_str}\n"
-        f"\u2502   Val  {meta.get('val_wr', 0)*100:.1f}%  /  Test  {up_test_wr*100:.1f}%  (min {_GATE*100:.1f}%)\n"
-        f"\u2502   Threshold \u2265 {threshold*100:.1f}%  \u2022  {meta.get('test_trades_per_day', 0):.1f} trades/day\n"
-        f"\u2502   EV/day  {up_ev_str}\n"
+        f"{_build_side_report_section(meta, 'up', up_threshold, gate=_GATE)}"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"{down_section}"
+        f"{_build_side_report_section(meta, 'down', down_threshold)}"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "Candidate saved - eligible to become current after review.\n"
         "Use /promote_model to deploy  \u2022  /model to compare"
     )
 
