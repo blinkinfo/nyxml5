@@ -11,6 +11,35 @@ def _e(value: object) -> str:
     return _html.escape(str(value))
 
 
+def _resolve_model_thresholds(meta: dict, threshold: float | None = None) -> tuple[float, float]:
+    """Resolve status-display thresholds with explicit override first, then metadata fallback."""
+    up_thr = threshold if threshold is not None else meta.get("threshold")
+    if up_thr is None:
+        up_thr = meta.get("models", {}).get("up", {}).get("threshold")
+    if up_thr is None:
+        up_thr = 0.535
+
+    down_thr = meta.get("down_threshold")
+    if down_thr is None:
+        down_thr = meta.get("models", {}).get("down", {}).get("threshold")
+    if down_thr is None:
+        down_thr = round(1.0 - float(up_thr), 4)
+
+    return float(up_thr), float(down_thr)
+
+
+def _has_validated_down_side(meta: dict) -> bool:
+    """Return True only when DOWN validation metrics actually exist."""
+    return meta.get("down_val_wr") is not None and meta.get("down_test_wr") is not None
+
+def _resolve_inference_mode(meta: dict) -> tuple[str, str]:
+    """Return machine value and human label for live inference architecture."""
+    mode = meta.get("inference_mode")
+    if mode == "dual":
+        return "dual", "Dual booster"
+    return "legacy_single", "Legacy single-model fallback"
+
+
 # ---------------------------------------------------------------------------
 # Risk card helper — shared by both retrain formatters.
 #
@@ -841,9 +870,10 @@ def format_pattern_stats(rows: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 def format_model_status(slot: str, meta: dict, threshold: float) -> str:
-    """Show model status summary including DOWN validation results."""
-    down_enabled = meta.get("down_enabled", False)
-    down_thr     = meta.get("down_threshold", round(1.0 - threshold, 4))
+    """Show model status summary including legacy fallback and DOWN validation state."""
+    threshold, down_thr = _resolve_model_thresholds(meta, threshold)
+    down_enabled = bool(meta.get("down_enabled", False))
+    _, inference_label = _resolve_inference_mode(meta)
     down_val_wr  = meta.get("down_val_wr")
     down_test_wr = meta.get("down_test_wr")
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
@@ -852,7 +882,7 @@ def format_model_status(slot: str, meta: dict, threshold: float) -> str:
     up_gate_icon = "\u2705" if up_gate_pct >= 58.0 else "\u274c"
     up_gate_lbl  = "PASS" if up_gate_pct >= 58.0 else "FAIL"
 
-    if down_val_wr is not None and down_test_wr is not None:
+    if _has_validated_down_side(meta):
         down_status_lbl = "ENABLED" if down_enabled else "DISABLED"
         down_status_icon = "\u2705" if down_enabled else "\u26d4"
         down_section = (
@@ -872,6 +902,7 @@ def format_model_status(slot: str, meta: dict, threshold: float) -> str:
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \U0001f4c5 Trained:  {str(meta.get('train_date', 'N/A'))[:16]} UTC\n"
         f"\u2502 \U0001f4ca Samples:  {meta.get('sample_count', 0):,}\n"
+        f"\u2502 \U0001f9e0 Inference: {inference_label}\n"
         "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \u2191 UP Side               {up_gate_icon} {up_gate_lbl}\n"
         f"\u2502   Win Rate   val {meta.get('val_wr', 0)*100:.1f}% / test {meta.get('test_wr', 0)*100:.1f}%\n"
@@ -886,9 +917,10 @@ def format_model_status(slot: str, meta: dict, threshold: float) -> str:
 def format_model_compare(current_meta: dict, candidate_meta: dict) -> str:
     """Side by side comparison of current vs candidate model, including DOWN validation."""
     def _fmt(m: dict, label: str) -> list[str]:
-        down_enabled = m.get("down_enabled", False)
+        up_thr, down_thr = _resolve_model_thresholds(m)
+        down_enabled = bool(m.get("down_enabled", False))
+        _, inference_label = _resolve_inference_mode(m)
         down_icon = "\u2705" if down_enabled else "\u274c"
-        down_thr = m.get("down_threshold", round(1.0 - m.get("threshold", 0.535), 4))
         down_val_wr = m.get("down_val_wr")
         down_test_wr = m.get("down_test_wr")
         down_tpd = m.get("down_test_tpd", m.get("down_val_tpd", 0))
@@ -897,10 +929,11 @@ def format_model_compare(current_meta: dict, candidate_meta: dict) -> str:
             f"<b>{label}</b>",
             f"  Trained  : {str(m.get('train_date', 'N/A'))[:19]}",
             f"  Samples  : {m.get('sample_count', 0):,}",
-            f"  \u2191 UP   thr={m.get('threshold', 0):.3f}  val={m.get('val_wr', 0)*100:.2f}%  "
+            f"  Infer    : {inference_label}",
+            f"  \u2191 UP   thr={up_thr:.3f}  val={m.get('val_wr', 0)*100:.2f}%  "
             f"test={m.get('test_wr', 0)*100:.2f}%  tpd={m.get('test_trades_per_day', 0):.1f}",
         ]
-        if down_val_wr is not None and down_test_wr is not None:
+        if _has_validated_down_side(m):
             rows.append(
                 f"  \u2193 DOWN {down_icon} thr={down_thr:.3f}  val={down_val_wr*100:.2f}%  "
                 f"test={down_test_wr*100:.2f}%  tpd={down_tpd:.1f}"
@@ -939,8 +972,9 @@ def format_retrain_blocked(meta: dict, threshold: float) -> tuple[str, str | Non
     Both messages must be sent with parse_mode='HTML'.
     """
     _GATE = 0.58
-    down_enabled = meta.get("down_enabled", False)
-    down_thr     = meta.get("down_threshold", round(1.0 - threshold, 4))
+    threshold, down_thr = _resolve_model_thresholds(meta, threshold)
+    down_enabled = bool(meta.get("down_enabled", False))
+    _, inference_label = _resolve_inference_mode(meta)
     down_val_wr  = meta.get("down_val_wr")
     down_test_wr = meta.get("down_test_wr")
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
@@ -966,7 +1000,7 @@ def format_retrain_blocked(meta: dict, threshold: float) -> tuple[str, str | Non
     up_ev_str  = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
 
     # DOWN section
-    if down_val_wr is not None and down_test_wr is not None:
+    if _has_validated_down_side(meta):
         down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
         down_status_icon = "\u2705" if down_enabled else "\u26d4"
         down_ev     = meta.get("down_ev_per_day", 0.0)
@@ -1013,8 +1047,9 @@ def format_retrain_complete(meta: dict, threshold: float) -> tuple[str, str | No
     Both messages must be sent with parse_mode='HTML'.
     """
     _GATE = 0.58
-    down_enabled = meta.get("down_enabled", False)
-    down_thr     = meta.get("down_threshold", round(1.0 - threshold, 4))
+    threshold, down_thr = _resolve_model_thresholds(meta, threshold)
+    down_enabled = bool(meta.get("down_enabled", False))
+    _, inference_label = _resolve_inference_mode(meta)
     down_val_wr  = meta.get("down_val_wr")
     down_test_wr = meta.get("down_test_wr")
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
@@ -1040,7 +1075,7 @@ def format_retrain_complete(meta: dict, threshold: float) -> tuple[str, str | No
     up_ev_str = f"{up_ev:+.2f}" if up_ev != 0.0 else "N/A"
 
     # DOWN section
-    if down_val_wr is not None and down_test_wr is not None:
+    if _has_validated_down_side(meta):
         down_status_lbl  = "ENABLED" if down_enabled else "DISABLED"
         down_status_icon = "\u2705" if down_enabled else "\u26d4"
         down_ev     = meta.get("down_ev_per_day", 0.0)

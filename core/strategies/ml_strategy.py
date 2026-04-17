@@ -29,19 +29,59 @@ FEATURE_COLS = feat_eng.FEATURE_COLS  # 42 features in exact order
 # Module-level reload flag so cmd_promote_model can signal a reload
 _RELOAD_REQUESTED = False
 
-# Module-level preloaded model — injected at startup via set_model()
-_PRELOADED_MODEL = None
+# Module-level preloaded model bundle — injected at startup via set_model_bundle()
+_PRELOADED_MODEL_BUNDLE = None
+
+
+def _normalize_runtime_bundle(models: dict[str, Any] | None, metadata: dict | None = None) -> tuple[dict[str, Any] | None, dict]:
+    """Normalize runtime state without falsely upgrading legacy artifacts to dual-model inference."""
+    normalized_meta = model_store._normalize_bundle_metadata(metadata or {})
+    if not models:
+        return None, normalized_meta
+
+    normalized_models = dict(models)
+    up_model = normalized_models.get("up") or normalized_models.get("model")
+    down_model = normalized_models.get("down")
+    if up_model is None:
+        return None, normalized_meta
+
+    has_real_down_model = down_model is not None and down_model is not up_model
+    inference_mode = "dual" if has_real_down_model else "legacy_single"
+
+    normalized_models["up"] = up_model
+    if down_model is not None:
+        normalized_models["down"] = down_model
+    else:
+        normalized_models.pop("down", None)
+
+    models_meta = normalized_meta.setdefault("models", {})
+    up_meta = models_meta.setdefault("up", {})
+    down_meta = models_meta.setdefault("down", {})
+    if up_meta.get("threshold") is None:
+        up_meta["threshold"] = normalized_meta.get("threshold")
+    if down_meta.get("threshold") is None:
+        down_meta["threshold"] = normalized_meta.get("down_threshold")
+    if down_meta.get("enabled") is None:
+        down_meta["enabled"] = normalized_meta.get("down_enabled", False)
+
+    normalized_meta["threshold"] = up_meta.get("threshold")
+    normalized_meta["down_threshold"] = down_meta.get("threshold")
+    normalized_meta["down_enabled"] = bool(down_meta.get("enabled", False))
+    normalized_meta["inference_mode"] = inference_mode
+    normalized_meta["has_real_down_model"] = has_real_down_model
+    return normalized_models, normalized_meta
+
+
+def set_model_bundle(models: dict[str, Any], metadata: dict | None = None) -> None:
+    """Inject a pre-loaded model bundle at startup or after retrain/promote."""
+    global _PRELOADED_MODEL_BUNDLE
+    normalized_models, normalized_meta = _normalize_runtime_bundle(models, metadata)
+    _PRELOADED_MODEL_BUNDLE = {"models": normalized_models, "metadata": normalized_meta}
 
 
 def set_model(model) -> None:
-    """Inject a pre-loaded model instance at startup (or after retrain/promote).
-
-    Called from main.py post_init after loading the model from DB or disk.
-    The injected model is consumed by _load_model() on the next MLStrategy
-    instantiation or reload cycle.
-    """
-    global _PRELOADED_MODEL
-    _PRELOADED_MODEL = model
+    """Backward-compatible wrapper that injects a legacy single-model bundle."""
+    set_model_bundle({"up": model}, {})
 
 
 def request_model_reload() -> None:
@@ -54,7 +94,8 @@ class MLStrategy(BaseStrategy):
     """LightGBM-based signal strategy. Replaces PatternStrategy as the default."""
 
     def __init__(self):
-        self._model = None
+        self._models: dict[str, Any] | None = None
+        self._model_meta: dict[str, Any] = {}
         self._funding_buffer: deque = deque(maxlen=24)
         self._model_slot = "current"
         # Track the last funding settlement timestamp that was appended to the
@@ -118,19 +159,28 @@ class MLStrategy(BaseStrategy):
 
     def _load_model(self) -> None:
         """Load the current model — use preloaded model if available, else load from disk."""
-        global _RELOAD_REQUESTED, _PRELOADED_MODEL
-        if _PRELOADED_MODEL is not None:
-            self._model = _PRELOADED_MODEL
-            _PRELOADED_MODEL = None
+        global _RELOAD_REQUESTED, _PRELOADED_MODEL_BUNDLE
+        if _PRELOADED_MODEL_BUNDLE is not None:
+            self._models, preloaded_meta = _normalize_runtime_bundle(
+                _PRELOADED_MODEL_BUNDLE.get("models"),
+                _PRELOADED_MODEL_BUNDLE.get("metadata"),
+            )
+            self._model_meta = preloaded_meta
+            self._model_slot = preloaded_meta.get("slot", "current")
+            _PRELOADED_MODEL_BUNDLE = None
             _RELOAD_REQUESTED = False
-            log.info("MLStrategy: model set from preloaded instance")
+            log.info("MLStrategy: model bundle set from preloaded instance")
+            return
+
+        models, meta = model_store.load_model_bundle("current")
+        self._models, normalized_meta = _normalize_runtime_bundle(models, meta)
+        self._model_meta = normalized_meta
+        self._model_slot = normalized_meta.get("slot", "current")
+        _RELOAD_REQUESTED = False
+        if self._models is None:
+            log.warning("MLStrategy: no trained model bundle found in current slot")
         else:
-            self._model = model_store.load_model("current")
-            _RELOAD_REQUESTED = False
-            if self._model is None:
-                log.warning("MLStrategy: no trained model found at models/model_current.lgb")
-            else:
-                log.info("MLStrategy: model loaded successfully")
+            log.info("MLStrategy: model bundle loaded successfully")
 
     async def _get_threshold(self) -> float:
         """Read UP threshold from ml_config table, fall back to cfg default."""
@@ -149,20 +199,52 @@ class MLStrategy(BaseStrategy):
         return cfg.ML_DEFAULT_THRESHOLD
 
     async def _get_down_threshold(self, up_threshold: float) -> float:
-        """Read DOWN threshold from ml_config table.
-
-        Falls back to the symmetric complement (1 - up_threshold) so the
-        system is fully backwards-compatible with models trained before
-        down_threshold was stored explicitly.
-        """
+        """Read DOWN threshold from DB, then model metadata, then legacy complement."""
         try:
             val = await queries.get_ml_down_threshold()
             if val is not None:
                 return val
         except Exception:
             pass
-        # Symmetric fallback: mirror of the UP threshold around 0.5
+        try:
+            meta = self._model_meta or model_store.load_metadata(self._model_slot)
+            if meta is not None and meta.get("down_threshold") is not None:
+                return float(meta["down_threshold"])
+        except Exception:
+            pass
         return round(1.0 - up_threshold, 4)
+
+    async def _resolve_thresholds(self) -> tuple[float, float]:
+        """Resolve runtime thresholds with DB override first, then metadata, then legacy defaults."""
+        meta = self._model_meta or model_store.load_metadata(self._model_slot) or {}
+
+        up_threshold = meta.get("threshold")
+        try:
+            db_up = await queries.get_ml_threshold()
+            if db_up is not None:
+                up_threshold = db_up
+        except Exception:
+            if up_threshold is None:
+                try:
+                    legacy_up = await queries.get_setting("ml_threshold")
+                    if legacy_up is not None:
+                        up_threshold = float(legacy_up)
+                except Exception:
+                    pass
+        if up_threshold is None:
+            up_threshold = cfg.ML_DEFAULT_THRESHOLD
+
+        down_threshold = meta.get("down_threshold")
+        try:
+            db_down = await queries.get_ml_down_threshold()
+            if db_down is not None:
+                down_threshold = db_down
+        except Exception:
+            pass
+        if down_threshold is None:
+            down_threshold = round(1.0 - float(up_threshold), 4)
+
+        return float(up_threshold), float(down_threshold)
 
     def _get_down_enabled(self) -> bool:
         """Read down_enabled flag from current model metadata.
@@ -171,7 +253,7 @@ class MLStrategy(BaseStrategy):
         ensuring backwards-compatibility with models trained before Option B.
         """
         try:
-            meta = model_store.load_metadata(self._model_slot)
+            meta = self._model_meta or model_store.load_metadata(self._model_slot)
             if meta is not None:
                 if meta.get("down_override", False):
                     return True
@@ -216,10 +298,10 @@ class MLStrategy(BaseStrategy):
             "slot_n1_slug":       slug,
         }
 
-        if self._model is None:
+        if self._models is None:
             self._load_model()
-            if self._model is None:
-                log.error("MLStrategy: no model loaded, skipping slot %s", slug)
+            if self._models is None:
+                log.error("MLStrategy: no model bundle loaded, skipping slot %s", slug)
                 inference_logger.log_skipped_data(
                     slot_slug=slug,
                     slot_ts=slot_ts,
@@ -337,14 +419,25 @@ class MLStrategy(BaseStrategy):
                 )
                 return {**base_fields, "reason": "Insufficient data for features"}
 
-            # Model inference — P(UP) as a single float in [0, 1]
-            prob = float(self._model.predict(feature_row)[0])
-            up_threshold   = await self._get_threshold()
-            down_threshold = await self._get_down_threshold(up_threshold)
+            up_model = self._models.get("up") if self._models else None
+            down_model = self._models.get("down") if self._models else None
+            if up_model is None:
+                raise RuntimeError("UP model missing from loaded model bundle")
 
-            # P(DOWN) = 1 - P(UP)
-            prob_down = round(1.0 - prob, 6)
+            # Model inference: always use the UP booster for p_up. Use the DOWN
+            # booster independently when present; otherwise fall back to legacy
+            # complement semantics without pretending that fallback is a real DOWN model.
+            prob = float(up_model.predict(feature_row)[0])
+            inference_mode = (self._model_meta or {}).get("inference_mode", "legacy_single")
+            has_real_down_model = bool((self._model_meta or {}).get("has_real_down_model", False))
+            if has_real_down_model and down_model is not None:
+                prob_down = float(down_model.predict(feature_row)[0])
+            else:
+                prob_down = round(1.0 - prob, 6)
+                inference_mode = "legacy_single"
+                has_real_down_model = False
 
+            up_threshold, down_threshold = await self._resolve_thresholds()
             up_qualifies = prob >= up_threshold
 
             # DOWN gate: only fire if the model's DOWN side was independently
@@ -426,6 +519,7 @@ class MLStrategy(BaseStrategy):
                                 "ml_up_threshold":   up_threshold,
                                 "ml_down_threshold": down_threshold,
                                 "ml_down_enabled":   down_enabled,
+                                "ml_inference_mode": inference_mode,
                             }
             except Exception as _rge:
                 # Never let the regime gate itself crash inference.
@@ -437,12 +531,11 @@ class MLStrategy(BaseStrategy):
             down_qualifies = down_enabled and (prob_down >= down_threshold)
 
             # Determine direction:
-            #   - Both qualify  → pick the one with the larger margin over its threshold.
-            #     With independently validated thresholds this is extremely rare
-            #     (would require p_up >= up_thr AND 1-p_up >= down_thr simultaneously)
-            #     but we handle it cleanly rather than crashing.
-            #   - Only one      → pick that one
-            #   - Neither       → skip
+            #   - Both qualify  -> pick the one with the larger margin over its threshold.
+            #   - Only one      -> pick that one.
+            #   - Neither       -> skip.
+            # Independent UP and DOWN models can both qualify, so arbitration must
+            # compare side-specific margin over threshold rather than assume parity.
             if up_qualifies and down_qualifies:
                 up_margin   = prob      - up_threshold
                 down_margin = prob_down - down_threshold
@@ -499,13 +592,14 @@ class MLStrategy(BaseStrategy):
                     "ml_up_threshold": up_threshold,
                     "ml_down_threshold": down_threshold,
                     "ml_down_enabled": down_enabled,
+                    "ml_inference_mode": inference_mode,
                 }
 
             log.info(
                 "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "
-                "down_enabled=%s slot=%s",
+                "down_enabled=%s inference_mode=%s slot=%s",
                 side, prob, prob_down, up_threshold, down_threshold,
-                down_enabled, slug,
+                down_enabled, inference_mode, slug,
             )
 
             # Fetch Polymarket prices — identical to PatternStrategy
@@ -551,6 +645,7 @@ class MLStrategy(BaseStrategy):
                     "ml_up_threshold":   up_threshold,
                     "ml_down_threshold": down_threshold,
                     "ml_down_enabled":   down_enabled,
+                    "ml_inference_mode": inference_mode,
                 }
 
             entry_price    = prices["up_price"]    if side == "Up" else prices["down_price"]
@@ -600,6 +695,7 @@ class MLStrategy(BaseStrategy):
                 "ml_up_threshold":  up_threshold,
                 "ml_down_threshold": down_threshold,
                 "ml_down_enabled":  down_enabled,
+                "ml_inference_mode": inference_mode,
             }
 
         except Exception as exc:

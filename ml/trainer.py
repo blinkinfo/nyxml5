@@ -584,7 +584,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         lgb.log_evaluation(period=50),
     ]
 
-    model = lgb.train(
+    up_model = lgb.train(
         LGBM_PARAMS,
         train_data,
         num_boost_round=NUM_BOOST_ROUND,
@@ -592,7 +592,19 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         callbacks=callbacks,
     )
 
-    log.info("train: best_iteration=%d", model.best_iteration)
+    down_train_data = lgb.Dataset(X_train, label=1 - y_train, feature_name=FEATURE_COLS)
+    down_val_data = lgb.Dataset(
+        X_val, label=1 - y_val, feature_name=FEATURE_COLS, reference=down_train_data
+    )
+    down_model = lgb.train(
+        LGBM_PARAMS,
+        down_train_data,
+        num_boost_round=NUM_BOOST_ROUND,
+        valid_sets=[down_val_data],
+        callbacks=callbacks,
+    )
+
+    log.info("train: up_best_iteration=%d down_best_iteration=%d", up_model.best_iteration, down_model.best_iteration)
 
     # ---------------------------------------------------------------------------
     # Thresholds derived from walk-forward validation (Option 2).
@@ -602,9 +614,9 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     best_threshold, down_threshold = aggregate_wf_thresholds(wf_results)
 
     # Evaluate val set for logging only (not used to set thresholds)
-    val_probs = model.predict(X_val)
+    val_probs = up_model.predict(X_val)
     _, best_wr, best_trades_per_day = sweep_threshold(val_probs, y_val)
-    down_probs_val = 1.0 - val_probs
+    down_probs_val = down_model.predict(X_val)
     y_val_down = 1 - y_val
     _, down_val_wr, down_val_tpd = sweep_threshold(down_probs_val, y_val_down)
 
@@ -626,14 +638,14 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         )
 
     # Evaluate on test set using threshold chosen from val set
-    test_probs = model.predict(X_test)
+    test_probs = up_model.predict(X_test)
     test_metrics = evaluate_at_threshold(test_probs, y_test, best_threshold)
 
     # DOWN test set evaluation — confirms DOWN threshold holds on held-out data.
     # If DOWN test WR < 59%, override down_enabled to False regardless of val result.
     down_test_metrics = evaluate_at_threshold(
-        1.0 - test_probs,  # P(DOWN) on test set
-        1 - y_test,        # DOWN labels on test set
+        down_model.predict(X_test),
+        1 - y_test,
         down_threshold,
     )
     if down_enabled and down_test_metrics["wr"] < 0.58:
@@ -798,15 +810,47 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "val_size": split_boundary - val_start,
         "test_size": n - split_boundary,
         "feature_cols": FEATURE_COLS,
-        "best_iteration": model.best_iteration,
+        "best_iteration": up_model.best_iteration,
         "blocked": blocked,
         # Training feature distribution stats for drift monitoring (check_feature_drift)
         "training_feature_stats": _training_feature_stats,
     }
-    model_store.save_model(model, slot, metadata)
+    metadata["artifact_version"] = 2
+    metadata["bundle_version"] = 2
+    metadata["format"] = "dual_bundle"
+    metadata["models"] = {
+        "up": {
+            "threshold": best_threshold,
+            "val_wr": best_wr,
+            "val_trades_per_day": best_trades_per_day,
+            "test_wr": test_metrics["wr"],
+            "test_precision": test_metrics["precision"],
+            "test_trades": test_metrics["trades"],
+            "test_trades_per_day": test_metrics["trades_per_day"],
+            "ev_per_day": _up_ev_per_day,
+            "best_iteration": up_model.best_iteration,
+            "enabled": True,
+            "blocked": blocked,
+        },
+        "down": {
+            "threshold": down_threshold,
+            "val_wr": down_val_wr,
+            "val_trades_per_day": down_val_tpd,
+            "test_wr": down_test_metrics["wr"],
+            "test_precision": down_test_metrics["precision"],
+            "test_trades": down_test_metrics["trades"],
+            "test_trades_per_day": down_test_metrics["trades_per_day"],
+            "ev_per_day": _down_ev_per_day,
+            "best_iteration": down_model.best_iteration,
+            "enabled": down_enabled,
+            "blocked": not down_enabled,
+        },
+    }
+    model_store.save_model_bundle({"up": up_model, "down": down_model}, slot, metadata)
 
     return {
-        "model": model,
+        "models": {"up": up_model, "down": down_model},
+        "model": up_model,
         "threshold": best_threshold,
         "down_threshold": down_threshold,
         "down_enabled": down_enabled,
@@ -816,7 +860,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "test_metrics": test_metrics,
         "val_wr": best_wr,
         "val_trades": best_trades_per_day,
-        "best_iteration": model.best_iteration,
+        "best_iteration": up_model.best_iteration,
         "blocked": blocked,
         "wf_results": wf_results,
         "warning_reason": (

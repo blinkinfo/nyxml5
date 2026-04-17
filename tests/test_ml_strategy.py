@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, '/home/nebula/nyxtest4')
+sys.path.insert(0, '/home/nebula/nyxml4.2')
 
 from ml.features import FEATURE_COLS
 
@@ -9,7 +9,7 @@ REQUIRED_TRADE_KEYS = REQUIRED_SKIP_KEYS | {'side', 'entry_price', 'opposite_pri
 
 
 def test_feature_count():
-    assert len(FEATURE_COLS) == 32
+    assert len(FEATURE_COLS) == 42
 
 
 def test_feature_cols_are_strings():

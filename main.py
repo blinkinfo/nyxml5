@@ -182,25 +182,23 @@ def main() -> None:
         try:
             from core.strategies import ml_strategy
             from ml import model_store
-            loaded = await model_store.load_model_from_db("current")
-            if loaded:
-                ml_strategy.set_model(loaded)
-                log.info("Startup: ML model loaded from DB")
+            loaded_models, loaded_meta = await model_store.load_model_bundle_from_db("current")
+            if loaded_models:
+                ml_strategy.set_model_bundle(loaded_models, loaded_meta or {})
+                log.info("Startup: ML model bundle loaded from DB")
             else:
-                disk_model = model_store.load_model("current")
-                if disk_model:
-                    ml_strategy.set_model(disk_model)
-                    log.info("Startup: ML model loaded from disk (fallback)")
-                    # Back-fill DB so the next redeploy can load from DB (ephemeral disk)
+                disk_models, disk_meta = model_store.load_model_bundle("current")
+                if disk_models:
+                    ml_strategy.set_model_bundle(disk_models, disk_meta or {})
+                    log.info("Startup: ML model bundle loaded from disk (fallback)")
                     try:
-                        disk_meta = model_store.load_metadata("current") or {}
-                        await model_store.save_model_to_db(disk_model, "current", disk_meta)
-                        log.info("Startup: disk model back-filled to DB for next redeploy")
+                        await model_store.save_model_bundle_to_db(disk_models, "current", disk_meta or {})
+                        log.info("Startup: disk model bundle back-filled to DB for next redeploy")
                     except Exception:
-                        log.exception("Startup: failed to back-fill disk model to DB (non-fatal)")
+                        log.exception("Startup: failed to back-fill disk model bundle to DB (non-fatal)")
                 else:
                     log.warning(
-                        "Startup: No ML model found — signals will be skipped until retrain"
+                        "Startup: No ML model bundle found — signals will be skipped until retrain"
                     )
         except Exception:
             log.exception(

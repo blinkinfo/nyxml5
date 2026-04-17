@@ -615,7 +615,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Answer immediately with cache_time to suppress Telegram re-fires on double-tap
         await query.answer("Promoting...", cache_time=10)
         from ml import model_store
-        from core.strategies.ml_strategy import request_model_reload, set_model as _set_model
+        from core.strategies.ml_strategy import request_model_reload, set_model_bundle as _set_model_bundle
         if not model_store.has_model("candidate"):
             await query.message.reply_text(
                 "&#x274C; No candidate model found. Please retrain first.\n"
@@ -632,9 +632,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 log.exception("ml_promote_anyway: failed to persist promotion to DB (disk promote succeeded)")
             # Inject the newly promoted model into the strategy before requesting reload
             try:
-                promoted = await model_store.load_model_from_db("current")
-                if promoted:
-                    _set_model(promoted)
+                promoted_models, promoted_meta = await model_store.load_model_bundle_from_db("current")
+                if promoted_models:
+                    _set_model_bundle(promoted_models, promoted_meta or {})
             except Exception:
                 log.exception("ml_promote_anyway: failed to preload promoted model into strategy (non-fatal)")
             request_model_reload()
@@ -1093,11 +1093,14 @@ async def cmd_model_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         send = update.callback_query.message.reply_text
     else:
         send = update.message.reply_text
-    meta = model_store.load_metadata("current")
-    if meta is None:
+    if not model_store.has_model("current"):
         await send("No model trained yet. Use /retrain to train one.", parse_mode="HTML")
         return
-    threshold = await queries.get_ml_threshold()
+    meta = model_store.load_metadata("current") or {}
+    try:
+        threshold = await queries.get_ml_threshold()
+    except Exception:
+        threshold = meta.get("threshold", 0.535)
     text = format_model_status("current", meta, threshold)
     await send(text, parse_mode="HTML", reply_markup=back_to_menu())
 
@@ -1111,14 +1114,14 @@ async def cmd_model_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         send = update.callback_query.message.reply_text
     else:
         send = update.message.reply_text
-    current_meta = model_store.load_metadata("current")
-    candidate_meta = model_store.load_metadata("candidate")
-    if current_meta is None:
+    if not model_store.has_model("current"):
         await send("No current model. Use /retrain to train one.", parse_mode="HTML")
         return
-    if candidate_meta is None:
+    if not model_store.has_model("candidate"):
         await send("No candidate model. Use /retrain to generate a candidate.", parse_mode="HTML")
         return
+    current_meta = model_store.load_metadata("current") or {}
+    candidate_meta = model_store.load_metadata("candidate") or {}
     text = format_model_compare(current_meta, candidate_meta)
     await send(text, parse_mode="HTML", reply_markup=back_to_menu())
 
@@ -1150,10 +1153,10 @@ async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # so _load_model() picks it up from memory rather than falling back to disk
     # (disk is ephemeral on Railway and may not have the model after a redeploy).
     try:
-        promoted = await model_store.load_model_from_db("current")
-        if promoted:
-            from core.strategies.ml_strategy import set_model
-            set_model(promoted)
+        from core.strategies.ml_strategy import set_model_bundle
+        promoted_models, promoted_meta = await model_store.load_model_bundle_from_db("current")
+        if promoted_models:
+            set_model_bundle(promoted_models, promoted_meta or {})
     except Exception:
         log.exception("cmd_promote_model: failed to preload promoted model into strategy (non-fatal)")
     request_model_reload()
@@ -1235,7 +1238,7 @@ async def _retrain_background(application, chat_id) -> None:
 
         # Persist trained candidate model to DB
         try:
-            await model_store.save_model_to_db(result["model"], "candidate", meta)
+            await model_store.save_model_bundle_to_db(result["models"], "candidate", meta)
         except Exception as db_exc:
             log.warning("Retrain: failed to save candidate to DB: %s", db_exc)
 
@@ -1271,7 +1274,7 @@ async def _retrain_background(application, chat_id) -> None:
                 from ml import model_store as _ms
                 from core.strategies.ml_strategy import (
                     request_model_reload as _req_reload,
-                    set_model as _set_model,
+                    set_model_bundle as _set_model_bundle,
                 )
                 _ms.promote_candidate()
                 try:
@@ -1279,9 +1282,9 @@ async def _retrain_background(application, chat_id) -> None:
                 except Exception:
                     log.exception("_retrain_background: failed to persist auto-promotion to DB (disk promote succeeded)")
                 try:
-                    _promoted = await _ms.load_model_from_db("current")
-                    if _promoted:
-                        _set_model(_promoted)
+                    _promoted_models, _promoted_meta = await _ms.load_model_bundle_from_db("current")
+                    if _promoted_models:
+                        _set_model_bundle(_promoted_models, _promoted_meta or {})
                 except Exception:
                     log.exception("_retrain_background: failed to preload auto-promoted model into strategy (non-fatal)")
                 _req_reload()

@@ -80,9 +80,13 @@ nyxmlopp/
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Template for required environment variables
 ├── autopoly.db             # SQLite database (created on first run)
-├── models/                 # Trained LightGBM model files (.lgb)
-│   ├── candidate.lgb       # Staged model (awaiting promotion)
-│   └── production.lgb      # Active production model
+├── models/                 # Trained LightGBM bundle artifacts (.lgb + metadata)
+│   ├── model_candidate_up.lgb
+│   ├── model_candidate_down.lgb
+│   ├── model_candidate_bundle_meta.json
+│   ├── model_current_up.lgb
+│   ├── model_current_down.lgb
+│   └── model_current_bundle_meta.json
 ├── core/                   # Trading engine
 ├── ml/                     # ML pipeline
 ├── bot/                    # Telegram interface
@@ -228,16 +232,17 @@ EARLY_STOPPING_ROUNDS = 50
 > **Blueprint Rule 10:** A retrained model is only promoted to production if its **test-set win rate ≥ 58%**. If the gate is not met, `DeploymentBlockedError` is raised and the candidate model is NOT promoted.
 
 Model lifecycle:
-1. `/retrain` → trains a new model → saved as `models/candidate.lgb`
-2. `/promote_model` → validates gate → copies candidate → `models/production.lgb`
-3. ML strategy hot-reloads the new production model without restart
+1. `/retrain` → trains independent UP and DOWN boosters and saves them into the `candidate` bundle slot
+2. `/promote_model` → copies the full candidate bundle to the `current` bundle slot
+3. ML strategy hot-reloads the new current bundle without restart
+4. Legacy single-model artifacts still load as a compatibility fallback until retrained
 
 ### Model Store (`ml/model_store.py`)
 
-- `save_candidate(model)` — serializes to `models/candidate.lgb`
-- `promote_candidate()` — validates WR gate, moves candidate → production
-- `load_production()` — deserializes active model
-- Metadata (WR, threshold, training date) stored in `model_metadata` DB table
+- Saves and loads bundle slots (`current`, `candidate`) with independent `up` and `down` boosters plus shared metadata
+- Persists the same bundle contract both on disk and in SQLite for rollback-safe reloads
+- Falls back to legacy single-model artifacts and mirrors them into both sides at load time
+- Shared metadata keeps legacy top-level fields plus bundle-specific directional sections under `models.up` and `models.down`
 
 ---
 
