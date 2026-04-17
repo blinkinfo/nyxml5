@@ -6,6 +6,7 @@ Uses get_next_slot_info() + get_slot_prices() exactly as PatternStrategy does.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timezone

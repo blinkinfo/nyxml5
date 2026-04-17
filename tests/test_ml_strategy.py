@@ -77,3 +77,35 @@ def test_ml_strategy_registered():
     from core.strategies import get_strategy
     s = get_strategy('ml')
     assert s is not None
+
+
+def test_ml_strategy_check_signal_uses_asyncio_live_path(monkeypatch):
+    import asyncio
+    from core.strategies.ml_strategy import MLStrategy
+
+    strategy = MLStrategy.__new__(MLStrategy)
+    strategy._models = {"up": object()}
+    strategy._model_meta = {}
+    strategy._funding_buffer = []
+    strategy._model_slot = "current"
+    strategy._last_funding_settlement = None
+
+    monkeypatch.setattr(
+        "core.strategies.ml_strategy.get_next_slot_info",
+        lambda: {
+            "slug": "slot-1",
+            "slot_start_ts": 123,
+            "slot_start_str": "09:00",
+            "slot_end_str": "09:05",
+            "slot_start_full": "2025-01-01 09:00:00 UTC",
+            "slot_end_full": "2025-01-01 09:05:00 UTC",
+        },
+    )
+
+    async def run_check_signal():
+        with monkeypatch.context() as m:
+            m.setattr("core.strategies.ml_strategy.asyncio.gather", lambda *args: (_ for _ in ()).throw(RuntimeError("stop after import resolution")))
+            result = await strategy.check_signal()
+            assert result is None
+
+    asyncio.run(run_check_signal())
